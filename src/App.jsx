@@ -165,16 +165,39 @@ function computeCriticalPath(rows) {
 
 
 // ─── CASCADE + CRITICAL PATH ─────────────────────────────────────────────────
+// Helper: find all ancestor IDs of a given row (rows that lead to it upstream)
+function getAncestors(targetId, rows) {
+  const idToRow = {};
+  rows.forEach(r => { idToRow[r.id] = r; });
+  const ancestors = new Set();
+  const stack = [targetId];
+  while (stack.length) {
+    const cur = stack.pop();
+    const row = idToRow[cur]; if (!row) continue;
+    [row.depId, row.dep2Id].forEach(pid => {
+      if (pid != null && !ancestors.has(pid)) {
+        ancestors.add(pid);
+        stack.push(pid);
+      }
+    });
+  }
+  return ancestors;
+}
+
 function cascadeAndCP(rows) {
   const arr = rows.map(r => ({...r}));
   const idxById = {};
   arr.forEach((r,i) => { idxById[r.id] = i; });
 
-  for (let pass = 0; pass < 6; pass++) {
+  // ── 6-pass cascade: handles both depId and dep2Id ────────────────────────
+  // Extra passes ensure long chains AND dep2 branches both converge fully
+  for (let pass = 0; pass < 8; pass++) {
+    let changed = false;
     for (let i = 0; i < arr.length; i++) {
       const row = arr[i];
       const deps = [row.depId, row.dep2Id].filter(d => d != null);
       if (!deps.length) continue;
+      // Find the latest effective-end among ALL predecessors (dep + dep2)
       let latestEnd = null;
       deps.forEach(pid => {
         const di = idxById[pid]; if (di == null) return;
@@ -187,9 +210,62 @@ function cascadeAndCP(rows) {
       arr[i] = { ...row, start: newStart, end: newEnd,
         workingDays: networkDays(newStart, newEnd),
         delayDays: row.revEnd ? delayCalendarDays(newEnd, row.revEnd) : null };
+      changed = true;
+    }
+    if (!changed) break; // converged early
+  }
+
+  // ── Option C: go-live gate ───────────────────────────────────────────────
+  // Going Live on D2C should not precede any of its upstream ancestors.
+  // Find the "Going Live on D2C" row and push its date if any ancestor ends later.
+  const goLiveIdx = arr.findIndex(r => r.task === "Going Live on D2C");
+  if (goLiveIdx >= 0) {
+    const glRow = arr[goLiveIdx];
+    // All ancestors of Going Live on D2C (excludes downstream like Dispatch POs)
+    const ancestors = getAncestors(glRow.id, arr);
+    let latestAncestorEnd = glRow.start || "";
+    ancestors.forEach(aid => {
+      const ai = idxById[aid]; if (ai == null) return;
+      const ae = getEffectiveEnd(arr[ai]) || arr[ai].end || "";
+      if (ae > latestAncestorEnd) latestAncestorEnd = ae;
+    });
+    // If any ancestor ends after current go-live start, push go-live forward
+    if (latestAncestorEnd > (glRow.start || "")) {
+      arr[goLiveIdx] = {
+        ...glRow,
+        start: latestAncestorEnd,
+        end: latestAncestorEnd, // td:0 so start=end
+        workingDays: 0,
+      };
     }
   }
 
+  // ── Re-resolve depEnd rows after cascade + go-live gate ───────────────────
+  // depEnd rows (e.g. IG halt, IG Pre-launch, KV Moodboard) anchor their END to
+  // another row's START. After dates shift, re-run the back-calc so they stay correct.
+  const idToArrRow = {};
+  arr.forEach(r => { idToArrRow[r.id] = r; });
+  for (let iter = 0; iter < 6; iter++) {
+    let changed = false;
+    for (let i = 0; i < arr.length; i++) {
+      const row = arr[i];
+      if (row.depEnd == null) continue;
+      const anchorRow = idToArrRow[row.depEnd];
+      if (!anchorRow) continue;
+      const newEnd = anchorRow.start;
+      if (!newEnd) continue;
+      const newStart = row.totalDays > 0
+        ? subtractCalendarDays(newEnd, row.totalDays) : newEnd;
+      if (row.start === newStart && row.end === newEnd) continue;
+      arr[i] = { ...row, start: newStart, end: newEnd,
+        workingDays: networkDays(newStart, newEnd) };
+      idToArrRow[row.id] = arr[i];
+      changed = true;
+    }
+    if (!changed) break;
+  }
+
+  // ── Recompute CP + float on final dates ──────────────────────────────────
   const { cpIds, nearCriticalIds, floatById, topoIds } = computeCriticalPath(arr);
   return arr.map(r => ({
     ...r,
@@ -296,6 +372,8 @@ const ISOLATE_TEMPLATE = [
   // IG halt (idx 67): depEnd:68 → end = IG Pre-launch start, back-calc 1 day
   {fn:"Overall Launch Plan",sf:"Insta Launch",task:"IG halt in regular programing",spoc:"Media Labs",td:1,wd:1,dep:null,depEnd:68,status:"Not Started"},
   {fn:"Overall Launch Plan",sf:"Insta Launch",task:"IG Pre-launch/Teaser",spoc:"Media Labs",td:1,wd:1,dep:null,depEnd:69,status:"Not Started"},
+  // IG Post-launch: depEnd:76 — its start+end = Going Live on D2C start (same day)
+  // Stage 2 back-calc sets this at build time; cascadeAndCP depEnd pass keeps it live
   {fn:"Overall Launch Plan",sf:"Insta Launch",task:"IG Post-launch",spoc:"Media Labs",td:0,wd:0,dep:null,depEnd:76,status:"Not Started"},
   // 70-76 DTC Website
   {fn:"Overall Launch Plan",sf:"DTC Website",task:"Finalize Listing SKUs for D2C",spoc:"Shrey + Abhinav",td:3,wd:3,dep:59,status:"Not Started"},
@@ -356,6 +434,7 @@ function buildFromTemplate(template, startDate) {
       isCritical:false, isNearCritical:false, floatDays:null, isOptional:!!t.isOptional,
       dep:t.dep, depId:t.dep!=null?t.dep:null,
       dep2Id:t.dep2!=null?t.dep2:null,
+      depElseId:t.depElse!=null?t.depElse:null,
       depEnd:t.depEnd||null,
     };
     rows[ti]=row; built[ti]=row;
@@ -378,7 +457,10 @@ function buildFromTemplate(template, startDate) {
         totalDays:t.td||0, workingDays:networkDays(start,end), delayDays:null,
         status:t.status||"Not Started", remarks:t.remarks||"",
         isCritical:false, isOptional:!!t.isOptional,
-        dep:t.dep, depId:t.dep!=null?t.dep:null, depEnd:t.depEnd,
+        dep:t.dep, depId:t.dep!=null?t.dep:null,
+        dep2Id:t.dep2!=null?t.dep2:null,
+        depElseId:t.depElse!=null?t.depElse:null,
+        depEnd:t.depEnd,
       };
       rows[ti]=row; built[ti]=row; changed=true;
     });
@@ -652,7 +734,10 @@ function NewProjectBuilder({onGenerate, onCancel}) {
         // If both filtered out, dep stays null (becomes anchor)
       }
       const newDepEnd = (t.depEnd != null && oldToNew[t.depEnd] != null) ? oldToNew[t.depEnd] : null;
-      return {...t, dep: newDep, depElse: undefined, depEnd: newDepEnd};
+      // Also remap dep2 — without this, dual-predecessor rows (like Going Live on D2C)
+      // lose their second predecessor when template is filtered
+      const newDep2 = (t.dep2 != null && oldToNew[t.dep2] != null) ? oldToNew[t.dep2] : null;
+      return {...t, dep: newDep, dep2: newDep2, depElse: undefined, depEnd: newDepEnd};
     });
 
     let rows;
@@ -1471,7 +1556,8 @@ function parseExcelRows(data) {
       start,end,revEnd,totalDays:td,workingDays:networkDays(start,end),
       delayDays:revEnd&&end?Math.max(0,delayCalendarDays(end,revEnd)):null,
       status:r[10]?String(r[10]).trim():"Not Started",remarks:r[11]?String(r[11]).trim():"",
-      isCritical:false,dep:null,depId:null,depEnd:null});
+      isCritical:false, isNearCritical:false, floatDays:null, topoOrder:0,
+      dep:null, depId:null, dep2Id:null, depElseId:null, depEnd:null});
   }
   // Compute CP on uploaded data
   const cpIds = computeCriticalPath(rows);
@@ -1514,12 +1600,46 @@ export default function App() {
     setRows(prev => {
       const target = prev.find(r=>r.id===id);
       if (!target) return prev;
-      const targetDepId = target.depId;
-      // Any row whose depId = deleted row gets bridged to deleted row's predecessor
+      const targetDepId   = target.depId;   // deleted row's own predecessor
+      const targetDep2Id  = target.dep2Id;  // deleted row's second predecessor
+
       const patched = prev.map(r => {
-        if (r.depId===id) return {...r, depId: targetDepId};
-        return r;
+        let updated = r;
+
+        // Bridge depId: any row that depended on the deleted row now points
+        // to the deleted row's own predecessor (keeps the chain intact)
+        if (r.depId === id) {
+          updated = {...updated, depId: targetDepId};
+        }
+        // Bridge dep2Id similarly
+        if (r.dep2Id === id) {
+          updated = {...updated, dep2Id: targetDep2Id};
+        }
+
+        // depElse re-evaluation: if a row's PRIMARY dep (depId) was pointing
+        // to the deleted row's predecessor (because it was already bridged),
+        // and the row has a depElse that is now a better fit, keep depElse
+        // as a fallback reference — the cascade will resolve it correctly.
+        // Specifically: if the deleted row was a dep anchor (like Lab tests)
+        // and a row had depElse pointing to an alternative (like V4 feedback),
+        // we set depId to depElse so the fallback activates.
+        if (r.depId === id && r.dep != null) {
+          // The row has a depElse — use it as the new depId
+          // depElse stores the original template fallback index as a row id
+          // We look it up by matching template dep index to actual row id
+          const depElseRow = r.depElseId != null
+            ? prev.find(x => x.id === r.depElseId)
+            : null;
+          if (depElseRow) {
+            updated = {...updated, depId: depElseRow.id};
+          } else {
+            updated = {...updated, depId: targetDepId};
+          }
+        }
+
+        return updated;
       });
+
       const filtered = patched.filter(r=>r.id!==id);
       return cascadeAndCP(filtered);
     });
@@ -1543,8 +1663,8 @@ export default function App() {
         start:startD, end:endD, revEnd:null,
         totalDays:tdNum, workingDays:networkDays(startD,endD),
         delayDays:null, status:"Not Started", remarks:"",
-        isCritical:false,
-        dep:null, depId: refRow?refRow.id:null, depEnd:null,
+        isCritical:false, isNearCritical:false, floatDays:null, topoOrder:0,
+        dep:null, depId: refRow?refRow.id:null, dep2Id:null, depElseId:null, depEnd:null,
       };
 
       // Patch the row that was immediately AFTER refRow: its depId should now point to newRow
