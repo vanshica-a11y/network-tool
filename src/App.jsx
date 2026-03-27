@@ -25,12 +25,17 @@ function delayCalendarDays(originalEnd, revisedEnd) {
   return Math.round((new Date(revisedEnd)-new Date(originalEnd))/86400000);
 }
 function calDays(start, end) {
-  if (!start||!end) return 0;
-  return Math.max(0, Math.round((new Date(end)-new Date(start))/86400000));
+  if (!start||!end||start===''||end==='') return 0;
+  const s=new Date(start),e=new Date(end);
+  if (isNaN(s.getTime())||isNaN(e.getTime())) return 0;
+  return Math.max(0, Math.round((e-s)/86400000));
 }
 function addCalendarDays(startDate, days) {
-  if (!startDate) return startDate;
-  const d = new Date(startDate); d.setDate(d.getDate()+days); return fmtDate(d);
+  if (!startDate || startDate === '') return startDate;
+  const d = new Date(startDate);
+  if (isNaN(d.getTime())) return startDate;
+  d.setDate(d.getDate() + (parseInt(days) || 0));
+  return fmtDate(d);
 }
 function subtractCalendarDays(endDate, days) {
   if (!endDate) return endDate;
@@ -83,6 +88,7 @@ function getEffectiveEnd(row) {
 // nearCriticalIds = float > 0 and <= 14 days.
 // topoOrder stored on return so flowchart can use it for correct sequencing.
 function computeCriticalPath(rows) {
+  rows = rows.filter(r => !r.isSubTask); // sub-tasks excluded from CP
   if (!rows.length) return { cpIds: new Set(), nearCriticalIds: new Set(), floatById: {}, topoIds: [] };
 
   const idToRow = {}, successors = {}, inDegree = {};
@@ -189,6 +195,16 @@ function cascadeAndCP(rows) {
   const idxById = {};
   arr.forEach((r,i) => { idxById[r.id] = i; });
 
+  // ── Sub-task parent recomputation: push parent revEnd if sub-tasks delayed
+  const _sp = {};
+  arr.forEach(r => { if(r.isSubTask&&r.parentId!=null){if(!_sp[r.parentId])_sp[r.parentId]=[];_sp[r.parentId].push(r);} });
+  Object.entries(_sp).forEach(([pid,subs]) => {
+    const pi=idxById[parseInt(pid)]; if(pi==null) return;
+    const par=arr[pi]; let maxE=par.end||"";
+    subs.forEach(s=>{const se=getEffectiveEnd(s)||s.end||"";if(se>maxE)maxE=se;});
+    if(maxE>(par.end||"")) arr[pi]={...par,revEnd:maxE,delayDays:delayCalendarDays(par.end,maxE)};
+  });
+
   // ── 6-pass cascade: handles both depId and dep2Id ────────────────────────
   // Extra passes ensure long chains AND dep2 branches both converge fully
   for (let pass = 0; pass < 8; pass++) {
@@ -215,6 +231,59 @@ function cascadeAndCP(rows) {
     if (!changed) break; // converged early
   }
 
+  // ── Sub-task proportional shift (preserves original TATs) ─────────────────
+  // When a parent's start shifts due to cascade, shift ALL its sub-tasks by the
+  // same delta in calendar days, keeping each sub-task's original TAT intact.
+  // Logic: newSubStart = subStart + parentDelta; newSubEnd = newSubStart + subTAT
+  // If newSubEnd would exceed parent effective end, clamp end but preserve TAT on row.
+  const _subPids = {};
+  arr.forEach(r => {
+    if (r.isSubTask && r.parentId != null) {
+      if (!_subPids[r.parentId]) _subPids[r.parentId] = [];
+      _subPids[r.parentId].push(r.id);
+    }
+  });
+  Object.entries(_subPids).forEach(([pidStr, subIds]) => {
+    const pid = parseInt(pidStr);
+    const pi = idxById[pid]; if (pi == null) return;
+    const par = arr[pi];
+    if (!par.start) return;
+    subIds.forEach(sid => {
+      const si = idxById[sid]; if (si == null) return;
+      const sub = arr[si];
+      if (!sub.start) return; // sub-task has no dates yet — skip
+      // Compute delta: how far parent start moved from sub's reference
+      // We use sub's start offset from parent start to determine proportional position
+      const parEffEnd = getEffectiveEnd(par) || par.end || '';
+      const parTAT    = par.totalDays || calDays(par.start, par.end);
+      const subTAT    = sub.totalDays || 0; // preserve this exactly
+      // Offset of sub-task start from parent start (in calendar days)
+      const offsetDays = calDays(par.start, sub.start);
+      // New start = parent start + same offset
+      let newStart = offsetDays > 0 ? addCalendarDays(par.start, offsetDays) : par.start;
+      // New end = new start + original sub TAT
+      let newEnd = subTAT > 0 ? addCalendarDays(newStart, subTAT) : newStart;
+      // Clamp: if new end exceeds parent effective end, slide start back to fit
+      if (parEffEnd && newEnd > parEffEnd) {
+        newEnd   = parEffEnd;
+        newStart = subTAT > 0 ? subtractCalendarDays(newEnd, subTAT) : newEnd;
+        // Final clamp: start cannot go before parent start
+        if (newStart < par.start) newStart = par.start;
+      }
+      // Only update if dates actually changed
+      if (newStart !== sub.start || newEnd !== sub.end) {
+        arr[si] = {
+          ...sub,
+          start: newStart,
+          end:   newEnd,
+          totalDays:   subTAT,  // TAT is NEVER changed
+          workingDays: networkDays(newStart, newEnd),
+          delayDays:   sub.revEnd ? delayCalendarDays(newEnd, sub.revEnd) : null,
+        };
+      }
+    });
+  });
+
   // ── Option C: go-live gate ───────────────────────────────────────────────
   // Going Live on D2C should not precede any of its upstream ancestors.
   // Find the "Going Live on D2C" row and push its date if any ancestor ends later.
@@ -235,6 +304,25 @@ function cascadeAndCP(rows) {
         ...glRow,
         start: latestAncestorEnd,
         end: latestAncestorEnd, // td:0 so start=end
+        workingDays: 0,
+      };
+    }
+  }
+
+  // ── Connect FG → GoLive +1 day rule ──────────────────────────────────────
+  // If Connect FG to forward warehouses ends later than the current GoLive start,
+  // push GoLive to ConnectFG.end + 1 calendar day (keeps td:0 intact).
+  // If other upstream tasks already push GoLive later, the existing gate above
+  // already handled that — this rule only activates when ConnectFG is the bottleneck.
+  const _cfg = arr.find(r => r.task === "Connect FG to forward warehouses");
+  const _glIdx2 = arr.findIndex(r => r.task === "Going Live on D2C");
+  if (_cfg && _cfg.end && _glIdx2 >= 0) {
+    const _cfgPlusOne = addCalendarDays(_cfg.end, 1);
+    if (_cfgPlusOne > (arr[_glIdx2].start || "")) {
+      arr[_glIdx2] = {
+        ...arr[_glIdx2],
+        start: _cfgPlusOne,
+        end:   _cfgPlusOne,   // td remains 0
         workingDays: 0,
       };
     }
@@ -285,112 +373,115 @@ function cascadeAndCP(rows) {
 // depElse = fallback dep if primary dep filtered out in New Project builder
 const ISOLATE_TEMPLATE = [
   // 0-5 Product NPD
-  {fn:"Product",sf:"NPD",task:"Product Version 1",spoc:"Rachna/Priyanka",td:7,wd:5,dep:null,status:"Done"},
-  {fn:"Product",sf:"NPD",task:"Consumer Tastings 1",spoc:"Rachna/Priyanka",td:5,wd:3,dep:0,status:"Done",remarks:"Check for feedback form verbatim/ responses"},
-  {fn:"Product",sf:"NPD",task:"Product Version 2",spoc:"Rachna/Priyanka",td:7,wd:5,dep:1,status:"Done"},
-  {fn:"Product",sf:"NPD",task:"Consumer Tastings 2",spoc:"Rachna/Priyanka",td:15,wd:10,dep:2,status:"In-progress",remarks:"Priyanka has restarted the process"},
-  {fn:"Product",sf:"NPD",task:"Recipe Lock",spoc:"Rachna/Priyanka",td:4,wd:3,dep:3,status:"Not Started"},
-  {fn:"Product",sf:"NPD",task:"Lab tests (BOP + Label Mandate Sheet Finalize + Shelf Life test)",spoc:"Rachna/Priyanka",td:30,wd:20,dep:4,status:"Not Started"},
+  {fn:"Product",sf:"NPD",sixPs:"Product",task:"Product Version 1",spoc:"Rachna/Priyanka",td:7,wd:5,dep:null,status:"Done"},
+  {fn:"Product",sf:"NPD",sixPs:"Product",task:"Consumer Tastings 1",spoc:"Rachna/Priyanka",td:5,wd:3,dep:0,status:"Done",remarks:"Check for feedback form verbatim/ responses"},
+  {fn:"Product",sf:"NPD",sixPs:"Product",task:"Product Version 2",spoc:"Rachna/Priyanka",td:7,wd:5,dep:1,status:"Done"},
+  {fn:"Product",sf:"NPD",sixPs:"Product",task:"Consumer Tastings 2",spoc:"Rachna/Priyanka",td:15,wd:10,dep:2,status:"In-progress",remarks:"Priyanka has restarted the process"},
+  {fn:"Product",sf:"NPD",sixPs:"Product",task:"Recipe Lock",spoc:"Rachna/Priyanka",td:4,wd:3,dep:3,status:"Not Started"},
+  {fn:"Product",sf:"NPD",sixPs:"Product",task:"Lab tests (BOP + Label Mandate Sheet Finalize + Shelf Life test)",spoc:"Rachna/Priyanka",td:30,wd:20,dep:4,status:"Not Started"},
   // 6-9 Category
-  {fn:"Category",sf:"Category",task:"Packaging Format",spoc:"Dhvanil/Shrey",td:4,wd:2,dep:null,status:"Done",remarks:"Unflavoured Isolate package - Minimal but more data / beginner friendly"},
-  {fn:"Category",sf:"Category",task:"Transit Test - New Packaging Structure (if needed)*",spoc:"Baskaran/Shrey",td:0,wd:0,dep:6,isOptional:true,status:"Not Started",remarks:"Not needed for this; 15 days TAT for round 1"},
-  {fn:"Category",sf:"Category",task:"SKU Mix",spoc:"Dhvanil/Shrey",td:1,wd:1,dep:6,status:"Done",remarks:"Only 1kg pouch for now."},
-  {fn:"Category",sf:"Category",task:"Consumer work - Functional Pro vs Lifestyle user",spoc:"Dhvanil/Shrey",td:25,wd:20,dep:6,status:"Done",remarks:"Ongoing, not impacting network timelines"},
+  {fn:"Category",sf:"Category",sixPs:"Pack",task:"Packaging Format",spoc:"Dhvanil/Shrey",td:15,wd:2,dep:null,status:"Done",remarks:"Unflavoured Isolate package - Minimal but more data / beginner friendly"},
+  {fn:"Category",sf:"Category",sixPs:"Pack",task:"Transit Test - New Packaging Structure (if needed)*",spoc:"Baskaran/Shrey",td:0,wd:0,dep:6,status:"Not Started",remarks:"Not needed for this; 15 days TAT for round 1"},
+  {fn:"Category",sf:"Category",sixPs:"Pack",task:"SKU Mix",spoc:"Dhvanil/Shrey",td:1,wd:1,dep:6,status:"Done",remarks:"Only 1kg pouch for now."},
+  {fn:"Category",sf:"Category",sixPs:"Proposition",task:"Consumer work",spoc:"Dhvanil/Shrey",td:25,wd:20,dep:6,status:"Done",remarks:"Ongoing, not impacting network timelines"},
   // 10-27 Design Pouch Packaging
-  {fn:"Design",sf:"Pouch Packaging",task:"Core proposition decision",spoc:"Dhvanil/Shrey",td:3,wd:3,dep:6,status:"Done",remarks:"Previous packs from TOD; BD note on Isolight approach"},
-  {fn:"Design",sf:"Pouch Packaging",task:"Shashank's feedback",spoc:"Shashank",td:5,wd:3,dep:10,status:"Done"},
-  {fn:"Design",sf:"Pouch Packaging",task:"Brief to TOD",spoc:"Dhvanil/Shrey",td:2,wd:2,dep:11,status:"Done",remarks:"Potential Delay due to NG prep"},
-  {fn:"Design",sf:"Pouch Packaging",task:"V1 of Pouch Artwork",spoc:"Shreya",td:7,wd:5,dep:12,status:"Done",remarks:"TOD still working on V1 pack"},
-  {fn:"Design",sf:"Pouch Packaging",task:"Feedback from Category + Consumer work pov share",spoc:"Dhvanil/Shrey",td:1,wd:1,dep:13,status:"Done"},
-  {fn:"Design",sf:"Pouch Packaging",task:"V2 of Pouch Artwork",spoc:"Shreya",td:7,wd:4,dep:14,status:"Done"},
-  {fn:"Design",sf:"Pouch Packaging",task:"Feedback from Shashank/Dhvanil",spoc:"TOD/Shashank",td:4,wd:2,dep:15,status:"Done"},
-  {fn:"Design",sf:"Pouch Packaging",task:"V3 of Pouch Artwork",spoc:"Shreya",td:7,wd:5,dep:16,status:"In-progress"},
-  {fn:"Design",sf:"Pouch Packaging",task:"Feedback from Shashank/Dhvanil (V3)",spoc:"TOD/Shashank",td:4,wd:4,dep:17,status:"Not Started"},
-  {fn:"Design",sf:"Pouch Packaging",task:"V4 of Pouch Artwork",spoc:"Shreya",td:5,wd:3,dep:18,status:"Not Started"},
-  {fn:"Design",sf:"Pouch Packaging",task:"Feedback on V4 artwork from QC/Regulatory",spoc:"Regulatory",td:4,wd:3,dep:19,status:"Not Started"},
-  {fn:"Design",sf:"Pouch Packaging",task:"Feedback from Shashank/Dhvanil (V4)",spoc:"TOD/Shashank",td:0,wd:0,dep:20,status:"Not Started"},
+  {fn:"Design",sf:"Pouch Packaging",sixPs:"Proposition",task:"Core proposition decision",spoc:"Dhvanil/Shrey",td:3,wd:3,dep:6,status:"Done",remarks:"Previous packs from TOD; BD note on Isolight approach"},
+  {fn:"Design",sf:"Pouch Packaging",sixPs:"Proposition",task:"Shashank's feedback",spoc:"Shashank",td:5,wd:3,dep:10,status:"Done"},
+  {fn:"Design",sf:"Pouch Packaging",sixPs:"Proposition",task:"Brief to TOD",spoc:"Dhvanil/Shrey",td:2,wd:2,dep:11,status:"Done",remarks:"Potential Delay due to NG prep"},
+  {fn:"Design",sf:"Pouch Packaging",sixPs:"Pack",task:"V1 of Pouch Artwork",spoc:"Mesha",td:7,wd:5,dep:12,status:"Done",remarks:"TOD still working on V1 pack"},
+  {fn:"Design",sf:"Pouch Packaging",sixPs:"Pack",task:"Feedback from Category",spoc:"Dhvanil/Shrey",td:1,wd:1,dep:13,status:"Done"},
+  {fn:"Design",sf:"Pouch Packaging",sixPs:"Pack",task:"V2 of Pouch Artwork",spoc:"Mesha",td:7,wd:4,dep:14,status:"Done"},
+  {fn:"Design",sf:"Pouch Packaging",sixPs:"Pack",task:"Feedback from Shashank/Dhvanil",spoc:"TOD/Shashank",td:4,wd:2,dep:15,status:"Done"},
+  {fn:"Design",sf:"Pouch Packaging",sixPs:"Pack",task:"V3 of Pouch Artwork",spoc:"Mesha",td:7,wd:5,dep:16,status:"In-progress"},
+  {fn:"Design",sf:"Pouch Packaging",sixPs:"Pack",task:"Feedback from Shashank/Dhvanil",spoc:"TOD/Shashank",td:4,wd:4,dep:17,status:"Not Started"},
+  {fn:"Design",sf:"Pouch Packaging",sixPs:"Pack",task:"V4 of Pouch Artwork",spoc:"Mesha",td:5,wd:3,dep:18,status:"Not Started"},
+  {fn:"Design",sf:"Pouch Packaging",sixPs:"Pack",task:"Feedback on V4 artwork from QC/Regulatory",spoc:"Regulatory",td:4,wd:3,dep:19,status:"Not Started"},
+  {fn:"Design",sf:"Pouch Packaging",sixPs:"Pack",task:"Feedback from Shashank/Dhvanil",spoc:"TOD/Shashank",td:0,wd:0,dep:20,status:"Not Started"},
   // BOP: dep:5 (Lab tests) when Product present; depElse:21 (V4 feedback) when Product absent
-  {fn:"Design",sf:"Pouch Packaging",task:"BOP + Label Mandate Sheet sent to TOD (readable format)",spoc:"Dhvanil/Shrey",td:1,wd:1,dep:5,depElse:21,status:"Not Started"},
-  {fn:"Design",sf:"Pouch Packaging",task:"V5 of Pouch Artwork",spoc:"Shreya",td:6,wd:4,dep:22,status:"Not Started"},
-  {fn:"Design",sf:"Pouch Packaging",task:"Colored Prints & Mockups of V4 of Pouch Artwork",spoc:"Komal/Shrey",td:7,wd:4,dep:23,status:"Not Started"},
-  {fn:"Design",sf:"Pouch Packaging",task:"Approval on V5 artwork from QC/Regulatory",spoc:"QC/Shrey",td:7,wd:4,dep:23,status:"Not Started"},
-  {fn:"Design",sf:"Pouch Packaging",task:"Feedback from Shashank/Dhvanil (V5)",spoc:"TOD/Shashank",td:2,wd:2,dep:25,status:"Not Started"},
-  {fn:"Design",sf:"Pouch Packaging",task:"Final Artwork Handover",spoc:"Shreya",td:3,wd:2,dep:26,status:"Not Started"},
+  {fn:"Design",sf:"Pouch Packaging",sixPs:"Pack",task:"BOP + Label Mandate Sheet sent to TOD (readable format)",spoc:"Dhvanil/Shrey",td:1,wd:1,dep:5,depElse:21,status:"Not Started"},
+  {fn:"Design",sf:"Pouch Packaging",sixPs:"Pack",task:"V5 of Pouch Artwork",spoc:"Mesha",td:6,wd:4,dep:22,dep2:21,status:"Not Started"},
+  {fn:"Design",sf:"Pouch Packaging",sixPs:"Pack",task:"Colored Prints & Mockups of V4 of Pouch Artwork",spoc:"Komal/Shrey",td:7,wd:4,dep:23,status:"Not Started"},
+  {fn:"Design",sf:"Pouch Packaging",sixPs:"Pack",task:"Approval on V5 artwork from QC/Regulatory",spoc:"QC/Shrey",td:7,wd:4,dep:23,status:"Not Started"},
+  {fn:"Design",sf:"Pouch Packaging",sixPs:"Pack",task:"Feedback from Shashank/Dhvanil",spoc:"TOD/Shashank",td:2,wd:2,dep:25,status:"Not Started"},
+  {fn:"Design",sf:"Pouch Packaging",sixPs:"Pack",task:"Final Artwork Handover",spoc:"Mesha",td:3,wd:2,dep:26,status:"Not Started"},
   // 28-29 Finance/Category
-  {fn:"Finance/Category",sf:"Pricing",task:"P&L / GM statement",spoc:"Shrey",td:7,wd:5,dep:4,status:"Not Started"},
-  {fn:"Finance/Category",sf:"Pricing",task:"Finalize channel & SKU mix based PL",spoc:"Vinit/Dhvanil/Shrey",td:3,wd:2,dep:28,status:"Not Started"},
+  {fn:"Finance/Category",sf:"Pricing",sixPs:"Price",task:"P&L / GM statement",spoc:"Shrey",td:7,wd:5,dep:4,status:"Not Started"},
+  {fn:"Finance/Category",sf:"Pricing",sixPs:"Place",task:"Finalize channel & SKU mix based PL",spoc:"Vinit/Dhvanil/Shrey",td:3,wd:2,dep:28,status:"Not Started"},
   // 30-34 Category DP
-  {fn:"Category",sf:"DP",task:"V1 Ambition demand plan - First cut assumptions",spoc:"Dhvanil/Shrey",td:3,wd:2,dep:29,status:"Not Started"},
-  {fn:"Category",sf:"DP",task:"Frontend meet - Setup all channels meeting for alignment",spoc:"Shrey",td:1,wd:0,dep:30,status:"Not Started",remarks:"N-2 consensus forecast meeting alignment"},
-  {fn:"Category",sf:"DP",task:"Backend meet - Setup production, procurement and ops team",spoc:"Shrey",td:1,wd:0,dep:31,status:"Not Started"},
-  {fn:"Category",sf:"DP",task:"Revisions to DP basis meetings",spoc:"Shrey",td:7,wd:5,dep:32,status:"Not Started"},
-  {fn:"Category",sf:"DP",task:"Share network mail to all channel owners",spoc:"Shrey",td:3,wd:3,dep:33,status:"Not Started"},
+  {fn:"Category",sf:"DP",sixPs:"Place",task:"V1 Ambition demand plan - First cut assumptions",spoc:"Dhvanil/Shrey",td:3,wd:2,dep:29,status:"Not Started"},
+  {fn:"Category",sf:"DP",sixPs:"Place",task:"Frontend meet - Setup all channels meeting for alignment",spoc:"Shrey",td:1,wd:0,dep:30,status:"Not Started",remarks:"N-2 consensus forecast meeting alignment"},
+  {fn:"Category",sf:"DP",sixPs:"Place",task:"Backend meet - Setup production, procurement and ops team",spoc:"Shrey",td:1,wd:0,dep:31,status:"Not Started"},
+  {fn:"Category",sf:"DP",sixPs:"Place",task:"Revisions to DP basis meetings",spoc:"Shrey",td:7,wd:5,dep:32,status:"Not Started"},
+  {fn:"Category",sf:"DP",sixPs:"Place",task:"Share network mail to all channel owners",spoc:"Shrey",td:3,wd:3,dep:33,status:"Not Started"},
   // 35-39 Category Pouch Renders (after Final Artwork Handover dep:27)
-  {fn:"Category",sf:"Pouch Renders",task:"Share pouch artwork for renders",spoc:"Shrey",td:2,wd:1,dep:27,status:"Not Started"},
-  {fn:"Category",sf:"Pouch Renders",task:"V1 of pouch renders",spoc:"Shrey",td:10,wd:8,dep:35,status:"Not Started"},
-  {fn:"Category",sf:"Pouch Renders",task:"Feedback from Category",spoc:"Shrey",td:1,wd:1,dep:36,status:"Not Started"},
-  {fn:"Category",sf:"Pouch Renders",task:"V2 of renders",spoc:"Shrey",td:7,wd:4,dep:37,status:"Not Started"},
-  {fn:"Category",sf:"Pouch Renders",task:"Approved Pouch Renders",spoc:"Shrey",td:3,wd:1,dep:38,status:"Not Started"},
+  {fn:"Category",sf:"Pouch Renders",sixPs:"Pack",task:"Share pouch artwork for renders",spoc:"Shrey",td:2,wd:1,dep:27,status:"Not Started"},
+  {fn:"Category",sf:"Pouch Renders",sixPs:"Pack",task:"V1 of pouch renders",spoc:"Shrey",td:10,wd:8,dep:35,status:"Not Started"},
+  {fn:"Category",sf:"Pouch Renders",sixPs:"Pack",task:"Feedback from Category",spoc:"Shrey",td:1,wd:1,dep:36,status:"Not Started"},
+  {fn:"Category",sf:"Pouch Renders",sixPs:"Pack",task:"V2 of renders",spoc:"Shrey",td:7,wd:4,dep:37,status:"Not Started"},
+  {fn:"Category",sf:"Pouch Renders",sixPs:"Pack",task:"Approved Pouch Renders",spoc:"Shrey",td:3,wd:1,dep:38,status:"Not Started"},
   // 40-42 Category NPI Details
-  {fn:"Category",sf:"NPI Details",task:"Get HSN Code",spoc:"Shrey",td:3,wd:3,dep:35,status:"Not Started"},
-  {fn:"Category",sf:"NPI Details",task:"Create Unicomm codes for all SKUs",spoc:"Amit/Shrey",td:2,wd:1,dep:40,status:"Not Started"},
-  {fn:"Category",sf:"NPI Details",task:"Share NPI Details with all Q-Com",spoc:"Shrey",td:4,wd:4,dep:39,status:"Not Started"},
+  {fn:"Category",sf:"NPI Details",sixPs:"Place",task:"Get HSN Code",spoc:"Shrey",td:3,wd:3,dep:35,status:"Not Started"},
+  {fn:"Category",sf:"NPI Details",sixPs:"Place",task:"Create Unicomm codes for all SKUs",spoc:"Amit/Shrey",td:2,wd:1,dep:40,status:"Not Started"},
+  {fn:"Category",sf:"NPI Details",sixPs:"Place",task:"Share NPI Details with all Q-Com",spoc:"Shrey",td:4,wd:4,dep:39,status:"Not Started"},
   // 43-47 Procurement
-  {fn:"Procurement - RM & PM",sf:"Vendor orders",task:"New supplier onboarding and assurance check (if needed)*",spoc:"Baskaran/Rachna",td:0,wd:0,dep:4,isOptional:true,status:"Not Started",remarks:"Not needed for this; 7-10 days TAT"},
-  {fn:"Procurement - RM & PM",sf:"Vendor orders",task:"Place order for RM as per demand plan",spoc:"Rachna",td:2,wd:2,dep:34,status:"Not Started",remarks:"Connect with Ayushi/Anirudh"},
-  {fn:"Procurement - RM & PM",sf:"Vendor orders",task:"Colour and text proofing for PM with vendor",spoc:"Komal/Shrey",td:4,wd:3,dep:27,status:"Not Started"},
-  {fn:"Procurement - RM & PM",sf:"Vendor orders",task:"Place order for pouch primary packaging",spoc:"Komal/Shrey",td:2,wd:2,dep:45,status:"Not Started"},
-  {fn:"Procurement - RM & PM",sf:"Vendor orders",task:"Pouch primary packaging arrives",spoc:"Komal/Shrey",td:31,wd:31,dep:46,status:"Not Started"},
+  {fn:"Procurement - RM & PM",sf:"Vendor orders",sixPs:"Product",task:"New supplier onboarding and assurance check (if needed)*",spoc:"Baskaran/Rachna",td:0,wd:0,dep:4,status:"Not Started",remarks:"Not needed for this; 7-10 days TAT"},
+  {fn:"Procurement - RM & PM",sf:"Vendor orders",sixPs:"Product",task:"Place order for RM as per demand plan",spoc:"Rachna",td:2,wd:2,dep:34,status:"Not Started",remarks:"Connect with Ayushi/Anirudh"},
+  {fn:"Procurement - RM & PM",sf:"Vendor orders",sixPs:"Pack",task:"TWT x Vendor - PM checklist + resolve printing issues",spoc:"Komal/Shrey",td:2,wd:2,dep:17,status:"Not Started"},
+  {fn:"Procurement - RM & PM",sf:"Vendor orders",sixPs:"Pack",task:"Text + Cylinder proofing - Check flat prints",spoc:"Komal/Shrey",td:0,wd:0,dep:27,status:"Not Started"},
+  {fn:"Procurement - RM & PM",sf:"Vendor orders",sixPs:"Pack",task:"Colour proofing for PM with vendor",spoc:"Komal/Shrey",td:4,wd:3,dep:46,status:"Not Started"},
+  {fn:"Procurement - RM & PM",sf:"Vendor orders",sixPs:"Pack",task:"Place order for pouch primary packaging",spoc:"Komal/Shrey",td:2,wd:2,dep:47,status:"Not Started"},
+  {fn:"Procurement - RM & PM",sf:"Vendor orders",sixPs:"Pack",task:"Pouch primary packaging arrives",spoc:"Komal/Shrey",td:31,wd:31,dep:48,status:"Not Started"},
   // 48-55 Production
-  {fn:"Production",sf:"RM Stock-buildup",task:"Connect RM to barkhana",spoc:"NPD Team",td:20,wd:16,dep:44,status:"Not Started"},
-  {fn:"Production",sf:"Approval",task:"Quality Approval - RM",spoc:"NPD Team",td:2,wd:2,dep:48,status:"Not Started"},
-  {fn:"Production",sf:"Approval",task:"Quality Approval - PM (Pouches)",spoc:"Samiksha",td:2,wd:2,dep:47,status:"Not Started"},
-  {fn:"Production",sf:"Quality Specs",task:"SOP + BOM + FG specs + Checklist from QA + TESTs",spoc:"Urvashi",td:4,wd:4,dep:50,status:"Not Started"},
-  {fn:"Production",sf:"Quality Specs",task:"SOP process construction and approval",spoc:"Urvashi",td:1,wd:1,dep:50,status:"Not Started"},
-  {fn:"Production",sf:"Trial Run",task:"Production Trial Run + Training",spoc:"NPD Team",td:0,wd:0,dep:51,status:"Not Started"},
-  {fn:"Production",sf:"Trial Run",task:"BBK Stock Run",spoc:"NPD Team",td:3,wd:2,dep:53,status:"Not Started"},
-  {fn:"Production",sf:"Stock-buildup",task:"Connect FG to forward warehouses",spoc:"Yash",td:7,wd:6,dep:54,status:"Not Started"},
+  {fn:"Production",sf:"RM Stock-buildup",sixPs:"Place",task:"Connect RM to barkhana",spoc:"NPD Team",td:20,wd:16,dep:44,status:"Not Started"},
+  {fn:"Production",sf:"Approval",sixPs:"Product",task:"Quality Approval - RM",spoc:"NPD Team",td:2,wd:2,dep:50,status:"Not Started"},
+  {fn:"Production",sf:"Approval",sixPs:"Pack",task:"Quality Approval - PM (Pouches)",spoc:"Samiksha",td:2,wd:2,dep:49,status:"Not Started"},
+  {fn:"Production",sf:"Quality Specs",sixPs:"Product",task:"SOP + BOM + FG specs + Checklist from QA + TESTs",spoc:"Urvashi",td:4,wd:4,dep:52,status:"Not Started"},
+  {fn:"Production",sf:"Quality Specs",sixPs:"Product",task:"SOP process construction and approval",spoc:"Urvashi",td:1,wd:1,dep:52,status:"Not Started"},
+  {fn:"Production",sf:"Trial Run",sixPs:"Product",task:"Production Trial Run + Training",spoc:"NPD Team",td:0,wd:0,dep:53,status:"Not Started"},
+  {fn:"Production",sf:"Trial Run",sixPs:"Product",task:"BBK Stock Run",spoc:"NPD Team",td:10,wd:2,dep:55,status:"Not Started"},
+  {fn:"Production",sf:"Stock-buildup",sixPs:"Place",task:"Connect FG to forward warehouses",spoc:"Yash",td:7,wd:6,dep:56,status:"Not Started"},
   // 56-59 Category Shoot
-  // KV Moodboard: depEnd:58 means its END = Shoot Day's START; start = end - 35 calendar days
-  {fn:"Category",sf:"Marketing Messages",task:"KV Moodboard Finalisation",spoc:"Shrey",td:35,wd:24,dep:null,depEnd:58,status:"Not Started"},
-  {fn:"Category",sf:"Product Samples",task:"Pouch Samples for Shoot",spoc:"Shrey",td:10,wd:10,dep:45,status:"Not Started",remarks:"Samples from pouch packaging vendor"},
-  {fn:"Category",sf:"Photo Shoot",task:"Shoot Day",spoc:"Media Labs Team",td:5,wd:3,dep:57,status:"Not Started",remarks:"Samples as requested from pouch packaging vendor"},
-  {fn:"Category",sf:"Photo Shoot",task:"Receiving Edited Images",spoc:"Media Labs Team",td:14,wd:9,dep:58,status:"Not Started"},
+  // KV Moodboard: depEnd:60 means its END = Shoot Day's START; start = end - 35 calendar days
+  {fn:"Category",sf:"Marketing Messages",sixPs:"Promotion",task:"KV Moodboard Finalisation",spoc:"Shrey",td:35,wd:24,dep:null,depEnd:60,status:"Not Started"},
+  {fn:"Category",sf:"Product Samples",sixPs:"Promotion",task:"Pouch Samples for Shoot",spoc:"Shrey",td:10,wd:10,dep:47,status:"Not Started",remarks:"Samples from pouch packaging vendor"},
+  {fn:"Category",sf:"Photo Shoot",sixPs:"Promotion",task:"Shoot Day",spoc:"Media Labs Team",td:5,wd:3,dep:59,status:"Not Started",remarks:"Samples as requested from pouch packaging vendor"},
+  {fn:"Category",sf:"Photo Shoot",sixPs:"Promotion",task:"Receiving Edited Images",spoc:"Media Labs Team",td:14,wd:9,dep:60,status:"Not Started"},
   // 60-66 Overall Launch Plan - Marketing
-  {fn:"Overall Launch Plan",sf:"Marketing Messages",task:"Q-Com listing images",spoc:"Media Labs Team",td:10,wd:8,dep:59,status:"Not Started"},
-  {fn:"Overall Launch Plan",sf:"Marketing Messages",task:"D2C listing images",spoc:"Media Labs Team",td:10,wd:8,dep:59,status:"Not Started",remarks:"Finalize assets"},
-  {fn:"Overall Launch Plan",sf:"Marketing Messages",task:"Amazon listing images + A+",spoc:"Media Labs Team",td:10,wd:8,dep:59,status:"Not Started"},
-  // IG brief & Website brief: depEnd:58 (end = Shoot Day start); start = end - 15 cal days
-  {fn:"Overall Launch Plan",sf:"Marketing Messages",task:"IG launch post caption brief to Samarth",spoc:"Shrey",td:15,wd:11,dep:null,depEnd:58,status:"Not Started"},
-  {fn:"Overall Launch Plan",sf:"Marketing Messages",task:"Website copy brief to Samarth",spoc:"Shrey",td:15,wd:11,dep:null,depEnd:58,status:"Not Started"},
-  // Final KV: dep:59 (Receiving Edited Images)
-  {fn:"Overall Launch Plan",sf:"Marketing Messages",task:"Final new KV + IG Pre-Launch and Final Launch Post Finalisation",spoc:"Media Labs Team",td:20,wd:15,dep:59,status:"Not Started"},
-  {fn:"Overall Launch Plan",sf:"Marketing Messages",task:"Regulatory approval for launch content - if any claims*",spoc:"Regulatory/Shrey",td:3,wd:2,dep:65,isOptional:true,status:"Not Started"},
+  {fn:"Overall Launch Plan",sf:"Marketing Messages",sixPs:"Promotion",task:"Q-Com listing images",spoc:"Media Labs Team",td:10,wd:8,dep:61,status:"Not Started"},
+  {fn:"Overall Launch Plan",sf:"Marketing Messages",sixPs:"Promotion",task:"D2C listing images",spoc:"Media Labs Team",td:10,wd:8,dep:61,status:"Not Started",remarks:"Finalize assets"},
+  {fn:"Overall Launch Plan",sf:"Marketing Messages",sixPs:"Promotion",task:"Amazon listing images + A+",spoc:"Media Labs Team",td:10,wd:8,dep:61,status:"Not Started"},
+  // IG brief & Website brief: depEnd:60 (end = Shoot Day start); start = end - 15 cal days
+  {fn:"Overall Launch Plan",sf:"Marketing Messages",sixPs:"Promotion",task:"IG launch post caption brief to Samarth",spoc:"Shrey",td:15,wd:11,dep:null,depEnd:60,status:"Not Started"},
+  {fn:"Overall Launch Plan",sf:"Marketing Messages",sixPs:"Promotion",task:"Website copy brief to Samarth",spoc:"Shrey",td:15,wd:11,dep:null,depEnd:60,status:"Not Started"},
+  // Final KV: dep:61 (Receiving Edited Images)
+  {fn:"Overall Launch Plan",sf:"Marketing Messages",sixPs:"Promotion",task:"Final new KV + IG Pre-Launch and Final Launch Post Finalisation",spoc:"Media Labs Team",td:20,wd:15,dep:61,status:"Not Started"},
+  {fn:"Overall Launch Plan",sf:"Marketing Messages",sixPs:"Promotion",task:"Regulatory approval for launch content - if any claims*",spoc:"Regulatory/Shrey",td:3,wd:2,dep:67,status:"Not Started"},
   // 67-69 Insta Launch — correct order: halt → pre → post
-  // IG Post-launch (idx 69): depEnd:76 → start = Going Live on D2C's start (same day), td:0
-  // IG Pre-launch (idx 68): depEnd:69 → end = IG Post-launch start, back-calc 1 day
-  // IG halt (idx 67): depEnd:68 → end = IG Pre-launch start, back-calc 1 day
-  {fn:"Overall Launch Plan",sf:"Insta Launch",task:"IG halt in regular programing",spoc:"Media Labs",td:1,wd:1,dep:null,depEnd:68,status:"Not Started"},
-  {fn:"Overall Launch Plan",sf:"Insta Launch",task:"IG Pre-launch/Teaser",spoc:"Media Labs",td:1,wd:1,dep:null,depEnd:69,status:"Not Started"},
-  // IG Post-launch: depEnd:76 — its start+end = Going Live on D2C start (same day)
+  // IG Post-launch (idx 69): depEnd:79 → start = Going Live on D2C's start (same day), td:0
+  // IG Pre-launch (idx 68): depEnd:71 → end = IG Post-launch start, back-calc 1 day
+  // IG halt (idx 67): depEnd:70 → end = IG Pre-launch start, back-calc 1 day
+  {fn:"Overall Launch Plan",sf:"Insta Launch",sixPs:"Promotion",task:"IG halt in regular programing",spoc:"Media Labs",td:1,wd:1,dep:null,depEnd:70,status:"Not Started"},
+  {fn:"Overall Launch Plan",sf:"Insta Launch",sixPs:"Promotion",task:"IG Pre-launch/Teaser",spoc:"Media Labs",td:1,wd:1,dep:null,depEnd:71,status:"Not Started"},
+  // IG Post-launch: depEnd:79 — its start+end = Going Live on D2C start (same day)
   // Stage 2 back-calc sets this at build time; cascadeAndCP depEnd pass keeps it live
-  {fn:"Overall Launch Plan",sf:"Insta Launch",task:"IG Post-launch",spoc:"Media Labs",td:0,wd:0,dep:null,depEnd:76,status:"Not Started"},
+  {fn:"Overall Launch Plan",sf:"Insta Launch",sixPs:"Promotion",task:"IG Post-launch",spoc:"Media Labs",td:0,wd:0,dep:null,depEnd:79,status:"Not Started"},
   // 70-76 DTC Website
-  {fn:"Overall Launch Plan",sf:"DTC Website",task:"Finalize Listing SKUs for D2C",spoc:"Shrey + Abhinav",td:3,wd:3,dep:59,status:"Not Started"},
-  // Home Page banner: depEnd:72 → end = Figma Wireframe start; start = end - 30 days
-  {fn:"Overall Launch Plan",sf:"DTC Website",task:"Home Page banner + Isolight page brief",spoc:"Ananya + Krishni",td:30,wd:20,dep:null,depEnd:72,status:"Not Started",remarks:"3 sub-brand pages"},
-  // Figma Wireframe: depEnd:73 → end = Figma Final handover start; start = end - 30 days
-  {fn:"Overall Launch Plan",sf:"DTC Website",task:"Figma design Wireframe - Product page + Shop Page",spoc:"D2C Team (Bhavesh)",td:30,wd:21,dep:null,depEnd:73,status:"Not Started"},
-  // Figma Final handover: dep:61 (D2C listing images)
-  {fn:"Overall Launch Plan",sf:"DTC Website",task:"Figma Final images handover",spoc:"D2C Team (Bhavesh)",td:7,wd:5,dep:61,status:"Not Started"},
-  {fn:"Overall Launch Plan",sf:"DTC Website",task:"Figma and Listing Images Proof Read",spoc:"Abhinav",td:2,wd:2,dep:73,status:"Not Started"},
-  {fn:"Overall Launch Plan",sf:"DTC Website",task:"Handover final figma to developers",spoc:"Abhinav",td:7,wd:5,dep:74,status:"Not Started"},
-  // dep2:55 = Connect FG to forward warehouses (warehouse must be ready before go-live)
-  {fn:"Overall Launch Plan",sf:"DTC Website",task:"Going Live on D2C",spoc:"Abhinav",td:0,wd:0,dep:75,dep2:55,status:"Not Started"},
+  {fn:"Overall Launch Plan",sf:"DTC Website",sixPs:"Place",task:"Finalize Listing SKUs for D2C",spoc:"Shrey + Abhinav",td:3,wd:3,dep:61,status:"Not Started"},
+  // Home Page banner: depEnd:74 → end = Figma Wireframe start; start = end - 30 days
+  {fn:"Overall Launch Plan",sf:"DTC Website",sixPs:"Place",task:"Home Page banner + Launch page brief",spoc:"Ananya + Krishni",td:30,wd:20,dep:null,depEnd:74,status:"Not Started",remarks:"3 sub-brand pages"},
+  // Figma Wireframe: depEnd:76 → end = Figma Final handover start; start = end - 30 days
+  {fn:"Overall Launch Plan",sf:"DTC Website",sixPs:"Place",task:"Figma design Wireframe - Product page + Shop Page",spoc:"D2C Team (Bhavesh)",td:30,wd:21,dep:null,depEnd:76,status:"Not Started"},
+  {fn:"Overall Launch Plan",sf:"DTC Website",sixPs:"Promotion",task:"Channels Activation (alongside D2C activations)",spoc:"Q-comm + Platforms",td:30,wd:21,dep:null,depEnd:76,status:"Not Started"},
+  // Figma Final handover: dep:63 (D2C listing images)
+  {fn:"Overall Launch Plan",sf:"DTC Website",sixPs:"Place",task:"Figma Final images handover",spoc:"D2C Team (Bhavesh)",td:7,wd:5,dep:63,status:"Not Started"},
+  {fn:"Overall Launch Plan",sf:"DTC Website",sixPs:"Place",task:"Figma and Listing Images Proof Read",spoc:"Abhinav",td:2,wd:2,dep:76,status:"Not Started"},
+  {fn:"Overall Launch Plan",sf:"DTC Website",sixPs:"Place",task:"Handover final figma to developers",spoc:"Abhinav",td:7,wd:5,dep:77,status:"Not Started"},
+  // dep2:57 = Connect FG to forward warehouses (warehouse must be ready before go-live)
+  {fn:"Overall Launch Plan",sf:"DTC Website",sixPs:"Place",task:"Going Live on D2C",spoc:"Abhinav",td:0,wd:0,dep:78,dep2:57,status:"Not Started"},
   // 77-79 Amazon & Q-Com
-  {fn:"Overall Launch Plan",sf:"Amazon",task:"Sharing Listing Images with Amazon",spoc:"Shrey",td:0,wd:0,dep:62,status:"Not Started"},
-  {fn:"Overall Launch Plan",sf:"Amazon",task:"Dispatch first set of POs on Amazon",spoc:"Ankita",td:4,wd:2,dep:76,status:"Not Started"},
-  {fn:"Overall Launch Plan",sf:"Q-Com",task:"Dispatch first set of POs on Q-Com",spoc:"KAMs",td:4,wd:2,dep:76,status:"Not Started"},
+  {fn:"Overall Launch Plan",sf:"Amazon",sixPs:"Place",task:"Sharing Listing Images with Amazon",spoc:"Shrey",td:0,wd:0,dep:64,status:"Not Started"},
+  {fn:"Overall Launch Plan",sf:"Amazon",sixPs:"Place",task:"Dispatch first set of POs on Amazon",spoc:"Ankita",td:4,wd:2,dep:79,status:"Not Started"},
+  {fn:"Overall Launch Plan",sf:"Q-Com",sixPs:"Place",task:"Dispatch first set of POs on Q-Com",spoc:"KAMs",td:4,wd:2,dep:79,status:"Not Started"},
 ];
 
 // ─── BUILD FROM TEMPLATE ─────────────────────────────────────────────────────
@@ -427,7 +518,7 @@ function buildFromTemplate(template, startDate) {
     }
     const end = t.td > 0 ? addCalendarDays(start, t.td) : start;
     const row = {
-      id:ti, fn:t.fn, sf:t.sf, task:t.task, spoc:t.spoc,
+      id:ti, fn:t.fn, sf:t.sf, sixPs:t.sixPs||"", task:t.task, spoc:t.spoc,
       start, end, revEnd:null,
       totalDays:t.td||0, workingDays:networkDays(start,end), delayDays:null,
       status:t.status||"Not Started", remarks:t.remarks||"",
@@ -452,7 +543,7 @@ function buildFromTemplate(template, startDate) {
       const prev=rows[ti];
       if (prev && prev.start===start) return;
       const row={
-        id:ti, fn:t.fn, sf:t.sf, task:t.task, spoc:t.spoc,
+        id:ti, fn:t.fn, sf:t.sf, sixPs:t.sixPs||"", task:t.task, spoc:t.spoc,
         start, end, revEnd:null,
         totalDays:t.td||0, workingDays:networkDays(start,end), delayDays:null,
         status:t.status||"Not Started", remarks:t.remarks||"",
@@ -470,13 +561,65 @@ function buildFromTemplate(template, startDate) {
   const finalRows = rows.filter(r=>r!=null);
   // Compute dynamic CP + float on fresh build
   const { cpIds, nearCriticalIds, floatById, topoIds } = computeCriticalPath(finalRows);
-  return finalRows.map(r=>({
+  const mapped = finalRows.map(r=>({
     ...r,
     isCritical: cpIds.has(r.id),
     isNearCritical: nearCriticalIds.has(r.id),
     floatDays: floatById[r.id] != null ? floatById[r.id] : null,
     topoOrder: topoIds.indexOf(r.id),
   }));
+  return addLabSubTasks(mapped);
+}
+
+// ─── PERMANENT LAB-TEST SUB-TASKS ─────────────────────────────────────────────
+// Inserts the 3 fixed sub-tasks under "Lab tests …" exactly once.
+// Called after every network build so they are always present.
+// Duplicate-safe: if they already exist (same parentId) they are not re-added.
+function addLabSubTasks(rows) {
+  const LAB_TASK = 'Lab tests (BOP + Label Mandate Sheet Finalize + Shelf Life test)';
+  const parent = rows.find(r => r.task === LAB_TASK && !r.isSubTask);
+  if (!parent) return rows;
+  // Duplicate guard — if any sub-task already has this parentId, skip
+  if (rows.some(r => r.isSubTask && r.parentId === parent.id)) return rows;
+  const SUB_DEFS = [
+    { id: 900001, task: 'Lab Tests complete > BOP Final',  spoc: 'Priyanka'         },
+    { id: 900002, task: 'LM Sheet Finalization',            spoc: 'Samiksha/Ranjitha' },
+    { id: 900003, task: 'Shelf Life Test complete',         spoc: 'Priyanka'         },
+  ];
+  const subs = SUB_DEFS.map(def => ({
+    id:           def.id,
+    fn:           parent.fn,
+    sf:           parent.sf,
+    sixPs:        parent.sixPs||"Product",
+    task:         def.task,
+    spoc:         def.spoc,
+    // Dates & duration always match parent
+    start:        parent.start,
+    end:          parent.end,
+    revEnd:       null,
+    totalDays:    parent.totalDays,
+    workingDays:  parent.workingDays,
+    delayDays:    null,
+    status:       'Not Started',
+    remarks:      '',
+    // Sub-task flags
+    isSubTask:    true,
+    parentId:     parent.id,
+    // CP / scheduling fields (sub-tasks are excluded from CP algorithm)
+    isCritical:   false,
+    isNearCritical: false,
+    floatDays:    null,
+    topoOrder:    0,
+    dep:          null,
+    depId:        null,
+    dep2Id:       null,
+    depElseId:    null,
+    depEnd:       null,
+  }));
+  const parentIdx = rows.findIndex(r => r.id === parent.id);
+  const result = [...rows];
+  result.splice(parentIdx + 1, 0, ...subs);
+  return result;
 }
 
 // ─── Q2 FIX: BACK-CALCULATE FROM GO-LIVE (self-correcting) ──────────────────
@@ -527,7 +670,8 @@ function buildFromTemplateBackward(template, targetGoLive) {
 }
 
 // ─── DEMO DATA ────────────────────────────────────────────────────────────────
-const INITIAL_ROWS = buildFromTemplate(ISOLATE_TEMPLATE, "2026-01-29");
+const INITIAL_ROWS_BASE = buildFromTemplate(ISOLATE_TEMPLATE, "2026-01-29");
+const INITIAL_ROWS      = addLabSubTasks(INITIAL_ROWS_BASE);
 
 const EXCEL_OVERRIDES = {
   "Product Version 1":              {status:"Done",      start:"2026-01-29",end:"2026-02-05"},
@@ -747,7 +891,9 @@ function NewProjectBuilder({onGenerate, onCancel}) {
       rows = buildFromTemplate(filteredTemplate, startDate);
     }
     // Reset all statuses to "Not Started" for a clean new network
-    rows = rows.map(r => ({...r, status: "Not Started"}));
+    rows = rows.map(r => ({...r, status: "Not Started", remarks: ""}));
+    // Always inject the permanent Lab-test sub-tasks
+    rows = addLabSubTasks(rows);
     onGenerate(rows, name);
   };
 
@@ -852,135 +998,686 @@ function NewProjectBuilder({onGenerate, onCancel}) {
 }
 
 // ─── NETWORK TABLE ────────────────────────────────────────────────────────────
-function NetworkTable({rows, onUpdate, onDelete, onAddRow, projectName, goLiveDate}) {
-  const [showAddModal, setShowAddModal] = useState(false);
+// FilterDropdown, DateRangeFilter, TaskSearchFilter are module-level components
+// (not defined inside NetworkTable) so they never lose focus on re-renders.
 
-  const grouped = useMemo(()=>{
+function FilterDropdown({colKey, values, active, onToggle, onClear}) {
+  const [open, setOpen] = useState(false);
+  const [rect, setRect] = useState(null);
+  const btnRef  = useRef();
+  const menuRef = useRef();
+
+  useEffect(() => {
+    if (!open) return;
+    const close = e => {
+      if (menuRef.current && menuRef.current.contains(e.target)) return;
+      if (btnRef.current  && btnRef.current.contains(e.target))  return;
+      setOpen(false);
+    };
+    document.addEventListener('mousedown', close);
+    return () => document.removeEventListener('mousedown', close);
+  }, [open]);
+
+  const toggle = e => {
+    e.stopPropagation();
+    if (!open && btnRef.current) {
+      // getBoundingClientRect gives viewport-relative coords, perfect for position:fixed
+      setRect(btnRef.current.getBoundingClientRect());
+    }
+    setOpen(o => !o);
+  };
+
+  // Calculate safe left position so dropdown doesn't go off right edge of screen
+  const safeLeft = rect ? Math.min(rect.left, (window.innerWidth || 800) - 190) : 0;
+  const top      = rect ? rect.bottom + 2 : 0;
+
+  const hasFilter = active && active.size > 0;
+  return (
+    <>
+      <span style={{display:'inline-block',marginLeft:2}}>
+        <button ref={btnRef} onClick={toggle}
+          style={{background:'none',border:'none',cursor:'pointer',padding:'1px 4px',
+            color:hasFilter?'#60A5FA':'#94A3B8',fontSize:9,lineHeight:1,
+            borderRadius:3,fontWeight:700}}>
+          {hasFilter ? '[F]' : '[=]'}
+        </button>
+      </span>
+      {open && rect && (
+        <div ref={menuRef}
+          style={{
+            position:'fixed',
+            top:  top,
+            left: safeLeft,
+            zIndex: 99999,
+            background:'#FFF',
+            border:'1px solid #CBD5E1',
+            borderRadius:8,
+            boxShadow:'0 8px 32px rgba(0,0,0,.22)',
+            minWidth:200,
+            maxHeight:280,
+            overflowY:'auto',
+            padding:6,
+          }}>
+          <button onClick={() => { onClear(); setOpen(false); }}
+            style={{width:'100%',textAlign:'left',padding:'5px 10px',fontSize:10,
+              background:'none',border:'none',cursor:'pointer',
+              color:'#6366F1',fontWeight:700,borderBottom:'1px solid #F1F5F9',
+              marginBottom:4,paddingBottom:8}}>
+            Clear filter
+          </button>
+          {[...values].sort().map(v => (
+            <label key={v}
+              style={{display:'flex',alignItems:'center',gap:8,padding:'5px 10px',
+                cursor:'pointer',fontSize:11,color:'#1E293B',
+                background: active && active.has(v) ? '#EEF2FF' : 'transparent',
+                borderRadius:5, marginBottom:1}}>
+              <input type='checkbox'
+                checked={!!(active && active.has(v))}
+                onChange={() => onToggle(v)}
+                style={{accentColor:'#6366F1',width:13,height:13,flexShrink:0}}/>
+              {v || '(blank)'}
+            </label>
+          ))}
+        </div>
+      )}
+    </>
+  );
+}
+
+function DateRangeFilter({value, onChange}) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef();
+  useEffect(()=>{
+    const h=e=>{if(ref.current&&!ref.current.contains(e.target))setOpen(false);};
+    document.addEventListener('mousedown',h);
+    return ()=>document.removeEventListener('mousedown',h);
+  },[]);
+  const active = value&&(value.from||value.to);
+  // Use local state for inputs to avoid re-render closing the popover
+  const [localFrom, setLocalFrom] = useState(value?.from||'');
+  const [localTo,   setLocalTo  ] = useState(value?.to  ||'');
+  useEffect(()=>{setLocalFrom(value?.from||'');},[value?.from]);
+  useEffect(()=>{setLocalTo  (value?.to  ||'');},[value?.to  ]);
+  const applyFrom = v => { setLocalFrom(v); onChange({...value, from:v}); };
+  const applyTo   = v => { setLocalTo  (v); onChange({...value, to:  v}); };
+  const clearAll  = () => { setLocalFrom(''); setLocalTo(''); onChange({from:'',to:''}); setOpen(false); };
+  return (
+    <div ref={ref} style={{position:'relative',display:'inline-block',marginLeft:2}}>
+      <button onClick={e=>{e.stopPropagation();setOpen(o=>!o);}}
+        style={{background:'none',border:'none',cursor:'pointer',padding:'1px 3px',
+          color:active?'#60A5FA':'#94A3B8',fontSize:9,lineHeight:1}}>
+        {active?'[D]':'[=]'}
+      </button>
+      {open&&(
+        <div style={{position:'absolute',top:'100%',left:0,zIndex:300,background:'#FFF',
+          border:'1px solid #E5E7EB',borderRadius:7,boxShadow:'0 4px 16px rgba(0,0,0,.15)',
+          padding:10,minWidth:210}}>
+          <div style={{fontSize:9,fontWeight:700,color:'#374151',marginBottom:6}}>Date range</div>
+          <div style={{display:'flex',flexDirection:'column',gap:7}}>
+            <div style={{display:'flex',alignItems:'center',gap:6}}>
+              <span style={{fontSize:9,color:'#6B7280',width:28}}>From</span>
+              <input type='date' value={localFrom}
+                onChange={e=>applyFrom(e.target.value)}
+                style={{flex:1,fontSize:9,border:'1px solid #E5E7EB',
+                  borderRadius:4,padding:'3px 5px',cursor:'pointer'}}/>
+            </div>
+            <div style={{display:'flex',alignItems:'center',gap:6}}>
+              <span style={{fontSize:9,color:'#6B7280',width:28}}>To</span>
+              <input type='date' value={localTo}
+                onChange={e=>applyTo(e.target.value)}
+                style={{flex:1,fontSize:9,border:'1px solid #E5E7EB',
+                  borderRadius:4,padding:'3px 5px',cursor:'pointer'}}/>
+            </div>
+            <button onClick={clearAll}
+              style={{fontSize:9,color:'#6366F1',background:'none',border:'none',
+                cursor:'pointer',textAlign:'left',padding:'2px 0',fontWeight:600}}>
+              Clear
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function NetworkTable({rows, onUpdate, onDelete, onAddRow, onAddSubTask, onDeleteSubTask, projectName, goLiveDate}) {
+  const [showAddModal, setShowAddModal] = useState(false);
+  const [expandedRows, setExpandedRows] = useState(new Set());
+
+  // ── Filter / sort state ────────────────────────────────────────────────────
+  const [sortCol,    setSortCol]    = useState(null);
+  const [filters,    setFilters]    = useState({});
+  const [taskSearch, setTaskSearch] = useState('');
+  const [dateRange,  setDateRange]  = useState({});
+
+  const isFiltered = (
+    Object.values(filters).some(s=>s&&s.size>0) ||
+    taskSearch.trim()!=='' ||
+    Object.values(dateRange).some(v=>v&&(v.from||v.to))
+  );
+  const isSorted = !!sortCol;
+  const locked   = isFiltered||isSorted;
+  const viewMode = locked ? 'flat' : 'grouped';
+
+  const filterVals = useMemo(()=>{
+    const m=rows.filter(r=>!r.isSubTask);
+    return {
+      fn:     new Set(m.map(r=>r.fn).filter(Boolean)),
+      sf:     new Set(m.map(r=>r.sf).filter(Boolean)),
+      sixPs:  new Set(m.map(r=>r.sixPs).filter(Boolean)),
+      spoc:   new Set(m.map(r=>r.spoc).filter(Boolean)),
+      status: new Set(m.map(r=>r.status).filter(Boolean)),
+    };
+  },[rows]);
+
+  const toggleFilter=(col,val)=>setFilters(prev=>{
+    const s=new Set(prev[col]||[]);s.has(val)?s.delete(val):s.add(val);return{...prev,[col]:s};
+  });
+  const clearFilter=col=>setFilters(prev=>({...prev,[col]:new Set()}));
+  const clearAll=()=>{setFilters({});setSortCol(null);setTaskSearch('');setDateRange({});};
+  const toggleSort=col=>setSortCol(prev=>{
+    if(!prev||prev.col!==col)return{col,dir:'asc'};
+    if(prev.dir==='asc')return{col,dir:'desc'};
+    return null;
+  });
+
+  const displayRows = useMemo(()=>{
+    let r=rows.filter(x=>!x.isSubTask);
+    Object.entries(filters).forEach(([col,vals])=>{
+      if(!vals||vals.size===0)return;
+      r=r.filter(x=>vals.has(x[col]));
+    });
+    if(taskSearch.trim()){
+      const q=taskSearch.trim().toLowerCase();
+      r=r.filter(x=>(x.task||'').toLowerCase().includes(q));
+    }
+    Object.entries(dateRange).forEach(([col,range])=>{
+      if(!range||(!range.from&&!range.to))return;
+      r=r.filter(x=>{
+        const d=x[col]||'';
+        if(range.from&&d<range.from)return false;
+        if(range.to  &&d>range.to  )return false;
+        return true;
+      });
+    });
+    if(sortCol){
+      const{col,dir}=sortCol;
+      r=[...r].sort((a,b)=>{
+        const va=a[col]||'',vb=b[col]||'';
+        return dir==='asc'?(va<vb?-1:va>vb?1:0):(va<vb?1:va>vb?-1:0);
+      });
+    }
+    return r;
+  },[rows,filters,taskSearch,dateRange,sortCol]);
+
+  const grouped=useMemo(()=>{
     const g={};
-    rows.forEach(r=>{
+    rows.filter(r=>!r.isSubTask).forEach(r=>{
       const k=`${r.fn}||${r.sf}`;
-      if(!g[k]) g[k]={fn:r.fn,sf:r.sf,rows:[]};
+      if(!g[k])g[k]={fn:r.fn,sf:r.sf,rows:[]};
       g[k].rows.push(r);
     });
     return Object.values(g);
   },[rows]);
 
-  // FIX #3,4,7: update cascades downstream
-  const updateRow = (id, field, value) => {
-    const row = rows.find(r=>r.id===id);
-    if (!row) return;
-    let updated = {...row, [field]: value};
+  const totalMain=rows.filter(r=>!r.isSubTask).length;
 
-    if (field==="start" || field==="end") {
-      updated.totalDays = calDays(updated.start, updated.end);
-      updated.workingDays = networkDays(updated.start, updated.end);
-    } else if (field==="totalDays") {
-      const days = parseInt(value)||0;
-      updated.end = addCalendarDays(updated.start, days);
-      updated.workingDays = networkDays(updated.start, updated.end);
+  // ── Row update helpers ─────────────────────────────────────────────────────
+  const updateRow=(id,field,value)=>{
+    if(locked)return;
+    const row=rows.find(r=>r.id===id);if(!row)return;
+    let u={...row,[field]:value};
+    if(field==='start'||field==='end'){
+      u.totalDays=calDays(u.start,u.end);u.workingDays=networkDays(u.start,u.end);
+    }else if(field==='totalDays'){
+      const d=parseInt(value)||0;
+      u.end=addCalendarDays(u.start,d);u.workingDays=networkDays(u.start,u.end);
     }
-
-    if (field==="revEnd" || field==="end" || field==="totalDays") {
-      updated.delayDays = (updated.revEnd && updated.revEnd > updated.end)
-        ? delayCalendarDays(updated.end, updated.revEnd) : null;
-    }
-
-    onUpdate(id, updated, true); // true = cascade
+    if(field==='revEnd'||field==='end'||field==='totalDays')
+      u.delayDays=(u.revEnd&&u.revEnd>u.end)?delayCalendarDays(u.end,u.revEnd):null;
+    onUpdate(id,u,true);
   };
 
-  const exportCSV = () => {
-    const h=["Function","Sub-Function","Task","Team SPOC","Start Date","End Date","Revised End Date","Total Days","Working Days","Delay Days","Status","Remarks"];
-    const r2=rows.map(r=>[r.fn,r.sf,r.task,r.spoc,r.start,r.end,r.revEnd||"",r.totalDays,r.workingDays,r.delayDays??"-",r.status,r.remarks].map(v=>`"${String(v||"").replace(/"/g,'""')}"`).join(","));
-    const csv=[h.join(","),...r2].join("\n");
-    const a=document.createElement("a"); a.href="data:text/csv;charset=utf-8,"+encodeURIComponent(csv); a.download=`${projectName||"network"}.csv`; a.click();
+  const updateSub=(id,field,value)=>{
+    const sub=rows.find(r=>r.id===id);if(!sub)return;
+    const par=rows.find(r=>r.id===sub.parentId);if(!par)return;
+    let u={...sub,[field]:value};
+    const parEnd=getEffectiveEnd(par)||par.end||'';
+    const siblings=rows.filter(r=>r.isSubTask&&r.parentId===sub.parentId&&r.id!==id);
+    const sibTAT=siblings.reduce((s,r)=>s+(r.totalDays||0),0);
+
+    if(field==='start'){
+      if(value&&par.start&&value<par.start){alert('Sub-task start ('+value+') before parent start ('+par.start+').');return;}
+      if(value&&u.end&&value>u.end)u.end=value;
+      u.totalDays=calDays(u.start,u.end||u.start);
+      u.workingDays=networkDays(u.start,u.end||u.start);
+    }else if(field==='end'){
+      if(value&&parEnd&&value>parEnd){alert('Sub-task end ('+value+') exceeds parent end ('+parEnd+').');return;}
+      if(value&&u.start&&value<u.start){alert('Sub-task end is before its start.');return;}
+      u.totalDays=calDays(u.start||value,value);
+      u.workingDays=networkDays(u.start||value,value);
+      if(sibTAT+u.totalDays>par.totalDays){alert('Sub-task TATs sum ('+(sibTAT+u.totalDays)+') exceeds parent TAT ('+par.totalDays+').');return;}
+    }else if(field==='totalDays'){
+      const d=parseInt(value)||0;
+      if(sibTAT+d>par.totalDays){alert('TATs sum ('+(sibTAT+d)+') would exceed parent TAT ('+par.totalDays+').');return;}
+      if(u.start){
+        const pe=addCalendarDays(u.start,d);
+        if(parEnd&&pe>parEnd){alert('Sub-task end ('+pe+') would exceed parent end ('+parEnd+').');return;}
+        u.end=pe;u.workingDays=networkDays(u.start,u.end);
+      }
+      u.totalDays=d;
+    }else if(field==='revEnd'){
+      u.revEnd=value||null;
+      u.delayDays=(u.revEnd&&u.revEnd>u.end)?delayCalendarDays(u.end,u.revEnd):null;
+    }
+    onUpdate(id,u,false);
+    onUpdate(sub.parentId,par,true);
   };
 
-  const cs={padding:"4px 6px",fontSize:10,borderRight:"1px solid #F3F4F6",verticalAlign:"middle"};
-  const th={...cs,background:"#1B2A4A",color:"#CBD5E1",fontWeight:700,textAlign:"left",position:"sticky",top:0,zIndex:2,fontSize:9};
+  const exportCSV=()=>{
+    const h=['Function','Sub-Function','6Ps Layer','Task','Type','SPOC','Start','End','Revised End',
+      'Total Days','WD','Delay Days','Status','Remarks'];
+    const r2=rows.map(r=>[r.fn,r.sf,r.isSubTask?'  '+r.task:r.task,
+      r.sixPs||'',r.isSubTask?'Sub-task':'Task',r.spoc,r.start,r.end,r.revEnd||'',
+      r.totalDays,r.workingDays,r.delayDays??'-',r.status,r.remarks]
+      .map(v=>`"${String(v||'').replace(/"/g,'""')}"`).join(','));
+    const csv=[h.join(','),...r2].join('\n');
+    const a=document.createElement('a');
+    a.href='data:text/csv;charset=utf-8,'+encodeURIComponent(csv);
+    a.download=`${projectName||'network'}.csv`;a.click();
+  };
+
+  // ── Styles ─────────────────────────────────────────────────────────────────
+  const cs={padding:'4px 6px',fontSize:10,borderRight:'1px solid #F3F4F6',verticalAlign:'middle'};
+  const thBase={padding:'4px 6px',fontSize:9,borderRight:'1px solid #2D3F5E',
+    verticalAlign:'middle',textAlign:'left',position:'sticky',top:0,zIndex:2,
+    color:'#CBD5E1',fontWeight:700,userSelect:'none'};
+
+  // SortIcon inline — no component to avoid re-mount
+  const sortIcon=col=>sortCol&&sortCol.col===col
+    ?(sortCol.dir==='asc'?' \u2191':' \u2193'):'';
+  const colActive=col=>(sortCol&&sortCol.col===col)||(filters[col]&&filters[col].size>0)
+    ||(dateRange[col]&&(dateRange[col].from||dateRange[col].to));
+
+  // ── Render sub-task row ────────────────────────────────────────────────────
+  // Sub-task rows always render inside grouped mode (sub-tasks hidden when locked).
+  // In grouped mode fn+sf are covered by rowSpan — sub-task rows need 11 cells only.
+  // In flat mode (locked) sub-tasks are not rendered at all.
+  const renderSub=(sub,par)=>{
+    const sc=ST_COLORS[sub.status]||ST_COLORS['Not Started'];
+    return (
+      <tr key={sub.id} style={{background:'#F5F3FF',borderBottom:'1px solid #EDE9FE'}}>
+        {/* 6Ps Layer — inherited from parent */}
+        <td style={{...cs,fontSize:9,fontWeight:600,color:'#6B7280',background:'#F5F3FF'}}>
+          {par.sixPs||''}
+        </td>
+        {/* Task cell — indented, NO fn/sf cells (covered by parent rowSpan) */}
+        <td style={{...cs,paddingLeft:20,borderLeft:'3px solid #6366F1'}}>
+          <div style={{display:'flex',alignItems:'center',gap:4}}>
+            <span style={{color:'#6366F1',fontSize:10,flexShrink:0,fontWeight:700}}>&rsaquo;</span>
+            <EC value={sub.task} onChange={v=>updateSub(sub.id,'task',v)}
+              style={{fontSize:10,color:'#3730A3',flex:1}}/>
+          </div>
+        </td>
+        {/* SPOC — now editable */}
+        <td style={cs}>
+          <EC value={sub.spoc||''} onChange={v=>updateSub(sub.id,'spoc',v)}
+            style={{fontSize:9,color:'#6B7280'}}/>
+        </td>
+        <td style={cs}><EC value={sub.start||''} type='date' onChange={v=>updateSub(sub.id,'start',v)}/></td>
+        <td style={cs}><EC value={sub.end||''} type='date' onChange={v=>updateSub(sub.id,'end',v)}/></td>
+        <td style={cs}>
+          <EC value={sub.revEnd||''} type='date' onChange={v=>updateSub(sub.id,'revEnd',v||null)}
+            style={{color:sub.revEnd?'#DC2626':'#9CA3AF'}}/>
+        </td>
+        <td style={cs}>
+          <EC value={sub.totalDays??''} type='number' onChange={v=>updateSub(sub.id,'totalDays',v)}
+            style={{textAlign:'center'}}/>
+        </td>
+        {/* WD — read-only formula */}
+        <td style={cs}><EC value={sub.workingDays??0} ro={true}/></td>
+        {/* Delay — read-only formula */}
+        <td style={{...cs,textAlign:'center',
+          color:sub.delayDays>0?'#EF4444':'#9CA3AF',
+          fontWeight:sub.delayDays>0?700:400,fontSize:10}}>
+          {sub.delayDays>0?'+'+sub.delayDays+'d':'\u2014'}
+        </td>
+        {/* Status — editable dropdown */}
+        <td style={cs}>
+          <EC value={sub.status||'Not Started'}
+            opts={['Done','In-progress','Not Started','Delayed']}
+            onChange={v=>updateSub(sub.id,'status',v)}
+            style={{background:sc.bg,color:sc.text,borderRadius:10,
+              padding:'2px 6px',fontWeight:700,fontSize:9}}/>
+        </td>
+        <td style={cs}>
+          <EC value={sub.remarks||''} onChange={v=>updateSub(sub.id,'remarks',v)}
+            style={{fontSize:9,color:'#9CA3AF'}}/>
+        </td>
+        <td style={{...cs,textAlign:'center',padding:2}}>
+          <button onClick={()=>onDeleteSubTask(sub.id)}
+            style={{background:'none',border:'none',cursor:'pointer',
+              color:'#EF4444',opacity:.6,padding:3,display:'flex'}}>
+            <I.Trash/>
+          </button>
+        </td>
+      </tr>
+    );
+  };
+
+  // ── Render main task row ───────────────────────────────────────────────────
+  const renderMain=(row,showFnSf,rowSpanCount,fc,showFn=showFnSf,fnRowSpan=rowSpanCount)=>{
+    const sc=ST_COLORS[row.status]||ST_COLORS['Not Started'];
+    const bg=row.isCritical?'#FFF8F8':'#FFF';
+    const subs=rows.filter(r=>r.isSubTask&&r.parentId===row.id);
+    const isExp=expandedRows.has(row.id);
+    const toggleExp=()=>setExpandedRows(prev=>{
+      const n=new Set(prev);n.has(row.id)?n.delete(row.id):n.add(row.id);return n;
+    });
+    return (
+      <React.Fragment key={row.id}>
+        <tr style={{background:bg,borderBottom:'1px solid #F3F4F6'}}>
+          {showFn&&(
+            <td rowSpan={fnRowSpan}
+              style={{...cs,background:fc.bg,borderLeft:`3px solid ${fc.border}`,
+                verticalAlign:'top',paddingTop:7}}>
+              <span style={{fontSize:9,fontWeight:800,color:fc.text}}>{row.fn}</span>
+            </td>
+          )}
+          {showFnSf&&(
+            <td rowSpan={rowSpanCount}
+              style={{...cs,background:fc.bg,verticalAlign:'top',paddingTop:7,
+                fontSize:9,color:fc.text}}>
+              {row.sf}
+            </td>
+          )}
+          <td style={{...cs,fontSize:9,fontWeight:600,color:fc.text,
+            background:fc.bg,verticalAlign:'middle'}}>
+            {row.sixPs||''}
+          </td>
+          <td style={cs}>
+            <div style={{display:'flex',alignItems:'center',gap:3}}>
+              <button onClick={toggleExp}
+                title={subs.length?(isExp?'Collapse':'Expand')+' sub-tasks':'Click +sub to add sub-tasks'}
+                style={{background:'none',border:'1px solid',
+                  borderColor:subs.length?'#6366F1':'#E5E7EB',borderRadius:3,
+                  cursor:'pointer',color:subs.length?'#6366F1':'#D1D5DB',
+                  fontSize:9,fontWeight:700,lineHeight:1,padding:'1px 3px',
+                  flexShrink:0,minWidth:16}}>
+                {isExp?'-':'+'}
+              </button>
+              {row.isCritical&&<span style={{color:'#EF4444',flexShrink:0}}><I.Zap/></span>}
+              {row.isNearCritical&&!row.isCritical&&(
+                <span title={'Near-critical: '+row.floatDays+'d float'}
+                  style={{color:'#D97706',flexShrink:0,fontSize:9,fontWeight:700}}>!</span>
+              )}
+              {locked
+                ?<span style={{fontSize:10,color:'#374151',flex:1}}>{row.task}</span>
+                :<EC value={row.task} onChange={v=>updateRow(row.id,'task',v)} style={{flex:1}}/>
+              }
+            </div>
+          </td>
+          <td style={cs}>{locked?<span style={{fontSize:10}}>{row.spoc}</span>:<EC value={row.spoc} onChange={v=>updateRow(row.id,'spoc',v)}/>}</td>
+          <td style={cs}>{locked?<span style={{fontSize:10}}>{row.start}</span>:<EC value={row.start} type='date' onChange={v=>updateRow(row.id,'start',v)}/>}</td>
+          <td style={cs}>{locked?<span style={{fontSize:10}}>{row.end}</span>:<EC value={row.end} type='date' onChange={v=>updateRow(row.id,'end',v)}/>}</td>
+          <td style={cs}>{locked?<span style={{fontSize:10,color:row.revEnd?'#DC2626':'#9CA3AF'}}>{row.revEnd||'\u2014'}</span>:<EC value={row.revEnd||''} type='date' onChange={v=>updateRow(row.id,'revEnd',v||null)} style={{color:row.revEnd?'#DC2626':'#9CA3AF'}}/>}</td>
+          <td style={cs}>{locked?<span style={{fontSize:10}}>{row.totalDays??0}</span>:<EC value={row.totalDays??0} type='number' onChange={v=>updateRow(row.id,'totalDays',v)} style={{textAlign:'center'}}/>}</td>
+          <td style={cs}><EC value={row.workingDays??0} ro={true}/></td>
+          <td style={{...cs,textAlign:'center',color:row.delayDays>0?'#EF4444':'#9CA3AF',fontWeight:row.delayDays>0?700:400,fontSize:10}}>
+            {row.delayDays>0?'+'+row.delayDays+'d':'\u2014'}
+          </td>
+          <td style={cs}>{locked
+            ?<span style={{background:sc.bg,color:sc.text,borderRadius:10,padding:'2px 6px',fontWeight:700,fontSize:9}}>{row.status}</span>
+            :<EC value={row.status} opts={['Done','In-progress','Not Started','Delayed']}
+                onChange={v=>updateRow(row.id,'status',v)}
+                style={{background:sc.bg,color:sc.text,borderRadius:10,padding:'2px 6px',fontWeight:700,fontSize:9}}/>}
+          </td>
+          <td style={cs}>{locked?<span style={{fontSize:9,color:'#9CA3AF'}}>{row.remarks}</span>:<EC value={row.remarks} onChange={v=>updateRow(row.id,'remarks',v)} style={{fontSize:9,color:'#9CA3AF'}}/>}</td>
+          <td style={{...cs,padding:2}}>
+            {!locked&&(
+              <div style={{display:'flex',flexDirection:'column',gap:1,alignItems:'center'}}>
+                <button
+                  onClick={()=>{
+                    onAddSubTask(row.id);
+                    setExpandedRows(prev=>{const n=new Set(prev);n.add(row.id);return n;});
+                  }}
+                  title='Add sub-task'
+                  style={{background:'none',border:'none',cursor:'pointer',
+                    color:'#6366F1',fontSize:8,fontWeight:700,padding:'1px 2px',opacity:.8}}>
+                  +sub
+                </button>
+                <button onClick={()=>onDelete(row.id)}
+                  style={{background:'none',border:'none',cursor:'pointer',
+                    color:'#EF4444',opacity:.6,padding:2,display:'flex'}}>
+                  <I.Trash/>
+                </button>
+              </div>
+            )}
+          </td>
+        </tr>
+        {/* Sub-task rows — only in grouped mode (locked hides sub-tasks) */}
+        {!locked&&isExp&&subs.map(s=>renderSub(s,row))}
+        {!locked&&isExp&&subs.length===0&&(
+          <tr style={{background:'#F8F7FF',borderBottom:'1px solid #EDE9FE'}}>
+            <td colSpan={12} style={{...cs,paddingLeft:32,color:'#9CA3AF',
+              fontSize:9,fontStyle:'italic'}}>
+              No sub-tasks yet \u2014 click "+sub" to add one
+            </td>
+            <td style={cs}/>
+          </tr>
+        )}
+      </React.Fragment>
+    );
+  };
 
   return (
     <div>
-      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
-        <span style={{fontSize:10,color:"#9CA3AF"}}>
-          ⚡ = critical path &nbsp;|&nbsp; <span style={{color:"#0369A1"}}>Working Days</span> = NETWORKDAYS formula (auto) &nbsp;|&nbsp; Total Days = editable
-        </span>
-        <div style={{display:"flex",gap:7}}>
-          <button onClick={()=>setShowAddModal(true)} style={{display:"flex",alignItems:"center",gap:5,padding:"6px 12px",background:"#EEF2FF",border:"1px dashed #6366F1",borderRadius:6,cursor:"pointer",fontSize:10,color:"#4F46E5",fontWeight:600}}>
-            <I.Plus/> Add Activity
-          </button>
-          <button onClick={exportCSV} style={{display:"flex",alignItems:"center",gap:5,padding:"6px 12px",background:"#F3F4F6",border:"1px solid #E5E7EB",borderRadius:6,cursor:"pointer",fontSize:10,color:"#374151"}}>
+      {/* Toolbar */}
+      <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',
+        marginBottom:8,flexWrap:'wrap',gap:6}}>
+        <div style={{display:'flex',alignItems:'center',gap:8,flexWrap:'wrap'}}>
+          <span style={{fontSize:10,color:'#9CA3AF'}}>
+            {'\u26A1'}=critical &nbsp;|&nbsp;
+            <span style={{color:'#0369A1'}}>WD</span>=NETWORKDAYS &nbsp;|&nbsp;
+            [+/-]=sub-tasks &nbsp;|&nbsp; [=]/[F]=filter
+          </span>
+          {locked&&(
+            <span style={{fontSize:10,background:'#FEF3C7',color:'#92400E',
+              padding:'2px 10px',borderRadius:10,fontWeight:600}}>
+              {displayRows.length} of {totalMain} tasks shown &mdash;{' '}
+              <span style={{textDecoration:'underline',cursor:'pointer'}}
+                onClick={clearAll}>clear all</span>
+            </span>
+          )}
+          {locked&&(
+            <span style={{fontSize:9,color:'#DC2626',background:'#FFF5F5',
+              padding:'2px 8px',borderRadius:10,border:'1px solid #FCA5A5'}}>
+              Editing disabled while filtered / sorted
+            </span>
+          )}
+        </div>
+        <div style={{display:'flex',gap:7}}>
+          {!locked&&(
+            <button onClick={()=>setShowAddModal(true)}
+              style={{display:'flex',alignItems:'center',gap:5,padding:'6px 12px',
+                background:'#EEF2FF',border:'1px dashed #6366F1',borderRadius:6,
+                cursor:'pointer',fontSize:10,color:'#4F46E5',fontWeight:600}}>
+              <I.Plus/> Add Activity
+            </button>
+          )}
+          <button onClick={exportCSV}
+            style={{display:'flex',alignItems:'center',gap:5,padding:'6px 12px',
+              background:'#F3F4F6',border:'1px solid #E5E7EB',borderRadius:6,
+              cursor:'pointer',fontSize:10,color:'#374151'}}>
             <I.Download/> Export CSV
           </button>
         </div>
       </div>
 
-      <div style={{overflowX:"auto",borderRadius:8,border:"1px solid #E5E7EB",boxShadow:"0 1px 3px rgba(0,0,0,.05)"}}>
-        <table style={{width:"100%",borderCollapse:"collapse",tableLayout:"fixed",minWidth:1080}}>
+      {/* Table */}
+      <div style={{overflowX:'auto',borderRadius:8,border:'1px solid #E5E7EB',
+        boxShadow:'0 1px 3px rgba(0,0,0,.05)'}}>
+        <table style={{width:'100%',borderCollapse:'collapse',
+          tableLayout:'fixed',minWidth:1080}}>
           <colgroup>
-            <col style={{width:100}}/><col style={{width:92}}/><col style={{width:210}}/>
+            <col style={{width:100}}/><col style={{width:92}}/><col style={{width:70}}/><col style={{width:210}}/>
             <col style={{width:100}}/><col style={{width:84}}/><col style={{width:84}}/>
             <col style={{width:84}}/><col style={{width:58}}/><col style={{width:66}}/>
-            <col style={{width:54}}/><col style={{width:88}}/><col style={{width:120}}/><col style={{width:34}}/>
+            <col style={{width:54}}/><col style={{width:88}}/><col style={{width:120}}/><col style={{width:42}}/>
           </colgroup>
           <thead>
             <tr>
-              {["Function","Sub-Fn","Task","SPOC","Start Date","End Date","Revised End","Total Days","WD (formula)","Delay","Status","Remarks",""].map((h,i)=>
-                <th key={i} style={th}>{h}</th>
-              )}
+              {/* Function */}
+              <th style={{...thBase,background:colActive('fn')?'#243553':'#1B2A4A',cursor:'pointer'}}
+                onClick={()=>toggleSort('fn')}>
+                <div style={{display:'flex',alignItems:'center',gap:2}}>
+                  <span style={{flex:1}}>Function{sortIcon('fn')}</span>
+                  <FilterDropdown colKey='fn' values={filterVals.fn}
+                    active={filters.fn} onToggle={v=>toggleFilter('fn',v)}
+                    onClear={()=>clearFilter('fn')}/>
+                </div>
+              </th>
+              {/* Sub-Fn */}
+              <th style={{...thBase,background:colActive('sf')?'#243553':'#1B2A4A',cursor:'pointer'}}
+                onClick={()=>toggleSort('sf')}>
+                <div style={{display:'flex',alignItems:'center',gap:2}}>
+                  <span style={{flex:1}}>Sub-Fn{sortIcon('sf')}</span>
+                  <FilterDropdown colKey='sf' values={filterVals.sf}
+                    active={filters.sf} onToggle={v=>toggleFilter('sf',v)}
+                    onClear={()=>clearFilter('sf')}/>
+                </div>
+              </th>
+              {/* 6Ps Layer */}
+              <th style={{...thBase,background:colActive('sixPs')?'#243553':'#1B2A4A',cursor:'pointer'}}
+                onClick={()=>toggleSort('sixPs')}>
+                <div style={{display:'flex',alignItems:'center',gap:2}}>
+                  <span style={{flex:1}}>6Ps Layer{sortIcon('sixPs')}</span>
+                  <FilterDropdown colKey='sixPs' values={filterVals.sixPs||new Set()}
+                    active={filters.sixPs} onToggle={v=>toggleFilter('sixPs',v)}
+                    onClear={()=>clearFilter('sixPs')}/>
+                </div>
+              </th>
+              {/* Task — search input rendered directly, not inside a sub-component header */}
+              <th style={{...thBase,background:taskSearch?'#243553':'#1B2A4A',cursor:'pointer'}}
+                onClick={()=>toggleSort('task')}>
+                <div style={{display:'flex',flexDirection:'column',gap:3}}>
+                  <span>Task{sortIcon('task')}</span>
+                  {/* Input is a direct child — no re-mount on state change */}
+                  <input
+                    type='text'
+                    placeholder='Search task...'
+                    value={taskSearch}
+                    onChange={e=>setTaskSearch(e.target.value)}
+                    onClick={e=>e.stopPropagation()}
+                    style={{width:'100%',fontSize:9,padding:'2px 5px',
+                      border:'1px solid #4A6380',borderRadius:4,
+                      outline:'none',background:'#243553',color:'#E2E8F0',
+                      boxSizing:'border-box'}}/>
+                </div>
+              </th>
+              {/* SPOC */}
+              <th style={{...thBase,background:colActive('spoc')?'#243553':'#1B2A4A',cursor:'pointer'}}
+                onClick={()=>toggleSort('spoc')}>
+                <div style={{display:'flex',alignItems:'center',gap:2}}>
+                  <span style={{flex:1}}>SPOC{sortIcon('spoc')}</span>
+                  <FilterDropdown colKey='spoc' values={filterVals.spoc}
+                    active={filters.spoc} onToggle={v=>toggleFilter('spoc',v)}
+                    onClear={()=>clearFilter('spoc')}/>
+                </div>
+              </th>
+              {/* Start Date */}
+              <th style={{...thBase,background:colActive('start')?'#243553':'#1B2A4A',cursor:'pointer'}}
+                onClick={()=>toggleSort('start')}>
+                <div style={{display:'flex',alignItems:'center',gap:2}}>
+                  <span style={{flex:1}}>Start Date{sortIcon('start')}</span>
+                  <DateRangeFilter value={dateRange.start||{}}
+                    onChange={v=>setDateRange(prev=>({...prev,start:v}))}/>
+                </div>
+              </th>
+              {/* End Date */}
+              <th style={{...thBase,background:colActive('end')?'#243553':'#1B2A4A',cursor:'pointer'}}
+                onClick={()=>toggleSort('end')}>
+                <div style={{display:'flex',alignItems:'center',gap:2}}>
+                  <span style={{flex:1}}>End Date{sortIcon('end')}</span>
+                  <DateRangeFilter value={dateRange.end||{}}
+                    onChange={v=>setDateRange(prev=>({...prev,end:v}))}/>
+                </div>
+              </th>
+              <th style={{...thBase,background:'#1B2A4A'}}>Revised End</th>
+              {/* Total Days */}
+              <th style={{...thBase,background:colActive('totalDays')?'#243553':'#1B2A4A',cursor:'pointer'}}
+                onClick={()=>toggleSort('totalDays')}>
+                Total Days{sortIcon('totalDays')}
+              </th>
+              <th style={{...thBase,background:'#1B2A4A'}}>WD (formula)</th>
+              {/* Delay */}
+              <th style={{...thBase,background:colActive('delayDays')?'#243553':'#1B2A4A',cursor:'pointer'}}
+                onClick={()=>toggleSort('delayDays')}>
+                Delay{sortIcon('delayDays')}
+              </th>
+              {/* Status */}
+              <th style={{...thBase,background:colActive('status')?'#243553':'#1B2A4A',cursor:'pointer'}}
+                onClick={()=>toggleSort('status')}>
+                <div style={{display:'flex',alignItems:'center',gap:2}}>
+                  <span style={{flex:1}}>Status{sortIcon('status')}</span>
+                  <FilterDropdown colKey='status' values={filterVals.status}
+                    active={filters.status} onToggle={v=>toggleFilter('status',v)}
+                    onClear={()=>clearFilter('status')}/>
+                </div>
+              </th>
+              <th style={{...thBase,background:'#1B2A4A'}}>Remarks</th>
+              <th style={{...thBase,background:'#1B2A4A'}}/>
             </tr>
           </thead>
           <tbody>
-            {grouped.map(group=>{
-              const fc=FN_COLORS[group.fn]||{bg:"#F9FAFB",border:"#E5E7EB",text:"#374151"};
-              return group.rows.map((row,ri)=>{
-                const sc=ST_COLORS[row.status]||ST_COLORS["Not Started"];
-                const bg=row.isCritical?"#FFF8F8":(ri%2===0?"#FFF":"#FAFAFA");
-                return (
-                  <tr key={row.id} style={{background:bg,borderBottom:"1px solid #F3F4F6"}}>
-                    {ri===0&&<td rowSpan={group.rows.length} style={{...cs,background:fc.bg,borderLeft:`3px solid ${fc.border}`,verticalAlign:"top",paddingTop:7}}><span style={{fontSize:9,fontWeight:800,color:fc.text}}>{group.fn}</span></td>}
-                    {ri===0&&<td rowSpan={group.rows.length} style={{...cs,background:fc.bg,verticalAlign:"top",paddingTop:7,fontSize:9,color:fc.text}}>{group.sf}</td>}
-                    <td style={cs}>
-                      <div style={{display:"flex",alignItems:"center",gap:3}}>
-                        {row.isCritical&&<span style={{color:"#EF4444",flexShrink:0}}><I.Zap/></span>}
-                        {row.isNearCritical&&!row.isCritical&&(
-                          <span title={"Near-critical: "+row.floatDays+"d float"}
-                            style={{color:"#D97706",flexShrink:0,fontSize:9,fontWeight:700,lineHeight:1}}>!</span>
-                        )}
-                        <EC value={row.task} onChange={v=>updateRow(row.id,"task",v)} style={{flex:1}}/>
-                      </div>
-                    </td>
-                    <td style={cs}><EC value={row.spoc} onChange={v=>updateRow(row.id,"spoc",v)}/></td>
-                    <td style={cs}><EC value={row.start} type="date" onChange={v=>updateRow(row.id,"start",v)}/></td>
-                    <td style={cs}><EC value={row.end} type="date" onChange={v=>updateRow(row.id,"end",v)}/></td>
-                    <td style={cs}>
-                      <EC value={row.revEnd||""} type="date" onChange={v=>updateRow(row.id,"revEnd",v||null)}
-                        style={{color: row.revEnd?"#DC2626":"#9CA3AF"}}/>
-                    </td>
-                    <td style={cs}><EC value={row.totalDays??0} type="number" onChange={v=>updateRow(row.id,"totalDays",v)} style={{textAlign:"center"}}/></td>
-                    <td style={cs}><EC value={row.workingDays??0} ro={true}/></td>
-                    <td style={{...cs,textAlign:"center",color:row.delayDays>0?"#EF4444":"#9CA3AF",fontWeight:row.delayDays>0?700:400,fontSize:10}}>
-                      {row.delayDays>0?`+${row.delayDays}d`:"—"}
-                    </td>
-                    <td style={cs}>
-                      <EC value={row.status} opts={["Done","In-progress","Not Started","Delayed"]} onChange={v=>updateRow(row.id,"status",v)}
-                        style={{background:sc.bg,color:sc.text,borderRadius:10,padding:"2px 6px",fontWeight:700,fontSize:9}}/>
-                    </td>
-                    <td style={cs}><EC value={row.remarks} onChange={v=>updateRow(row.id,"remarks",v)} style={{fontSize:9,color:"#9CA3AF"}}/></td>
-                    <td style={{...cs,textAlign:"center",padding:2}}>
-                      <button onClick={()=>onDelete(row.id)} style={{background:"none",border:"none",cursor:"pointer",color:"#EF4444",opacity:.6,padding:3,display:"flex"}}><I.Trash/></button>
-                    </td>
-                  </tr>
-                );
-              });
-            })}
+            {viewMode==='grouped'
+              ? (()=>{
+                  // Fn-merge: compute per-group visible row counts
+                  const groupVisRows=grouped.map(g=>g.rows.reduce((sum,row)=>{
+                    const subs=rows.filter(r=>r.isSubTask&&r.parentId===row.id);
+                    const isExp=expandedRows.has(row.id);
+                    return sum+1+(isExp?(subs.length>0?subs.length:1):0);
+                  },0));
+                  // Walk groups; first group of each contiguous fn block shows fn cell
+                  const fnMeta={};
+                  let gi=0;
+                  while(gi<grouped.length){
+                    const fn=grouped[gi].fn;
+                    let j=gi,span=0;
+                    while(j<grouped.length&&grouped[j].fn===fn){span+=groupVisRows[j];j++;}
+                    fnMeta[gi]={show:true,span};
+                    for(let k=gi+1;k<j;k++)fnMeta[k]={show:false,span:0};
+                    gi=j;
+                  }
+                  return grouped.map((g,gIdx)=>{
+                    const fc=FN_COLORS[g.fn]||{bg:'#F9FAFB',border:'#E5E7EB',text:'#374151'};
+                    const totalRows=groupVisRows[gIdx];
+                    const{show:showFn,span:fnRowSpan}=fnMeta[gIdx];
+                    return g.rows.map((row,ri)=>renderMain(
+                      row,ri===0,totalRows,fc,showFn&&ri===0,fnRowSpan
+                    ));
+                  });
+                })()
+              : displayRows.map(row=>{
+                  // Flat mode: each row gets fn/sf (rowSpan=1), no sub-tasks shown
+                  const fc=FN_COLORS[row.fn]||{bg:'#F9FAFB',border:'#E5E7EB',text:'#374151'};
+                  return renderMain(row,true,1,fc);
+                })
+            }
           </tbody>
         </table>
       </div>
 
-      {showAddModal && <AddRowModal groups={grouped} onAdd={onAddRow} onClose={()=>setShowAddModal(false)}/>}
+      {showAddModal&&(
+        <AddRowModal
+          groups={grouped}
+          onAdd={onAddRow}
+          onClose={()=>setShowAddModal(false)}/>
+      )}
     </div>
   );
 }
+
 
 // ─── SUMMARY BAR ─────────────────────────────────────────────────────────────
 function SummaryBar({rows, goLiveDate}) {
@@ -1027,7 +1724,7 @@ function GanttChart({rows, goLiveDate}) {
   let cur=new Date(startDate.getFullYear(),startDate.getMonth(),1);
   while(cur<=endDate){ months.push({label:cur.toLocaleDateString("en-IN",{month:"short",year:"2-digit"}),date:new Date(cur)}); cur=new Date(cur.getFullYear(),cur.getMonth()+1,1); }
 
-  const validRows=rows.filter(r=>r.start&&r.end);
+  const validRows=rows.filter(r=>r.start&&r.end&&!r.isSubTask);
   return (
     <div style={{overflowX:"auto"}}>
       <div style={{minWidth:900}}>
@@ -1079,7 +1776,7 @@ function GanttChart({rows, goLiveDate}) {
 // ─── CRITICAL PATH FLOWCHART ──────────────────────────────────────────────────
 function CPFlowchart({rows}) {
   const cpChain = useMemo(() => {
-    return rows.filter(r => r.isCritical && r.start)
+    return rows.filter(r => r.isCritical && r.start && !r.isSubTask)
                .sort((a,b) => {
                  // Sort by topological order if available (gives correct logical sequence)
                  // Fall back to start date for robustness
@@ -1091,7 +1788,7 @@ function CPFlowchart({rows}) {
   }, [rows]);
 
   const nonCp = useMemo(() =>
-    rows.filter(r => !r.isCritical && r.start && r.end), [rows]);
+    rows.filter(r => !r.isCritical && r.start && r.end && !r.isSubTask), [rows]);
 
   // Assign each non-CP row to the CP column it overlaps most in time
   function assignToCpNode(row) {
@@ -1557,6 +2254,7 @@ function parseExcelRows(data) {
       delayDays:revEnd&&end?Math.max(0,delayCalendarDays(end,revEnd)):null,
       status:r[10]?String(r[10]).trim():"Not Started",remarks:r[11]?String(r[11]).trim():"",
       isCritical:false, isNearCritical:false, floatDays:null, topoOrder:0,
+      sixPs:"",
       dep:null, depId:null, dep2Id:null, depElseId:null, depEnd:null});
   }
   // Compute CP on uploaded data
@@ -1640,13 +2338,34 @@ export default function App() {
         return updated;
       });
 
-      const filtered = patched.filter(r=>r.id!==id);
+      const filtered = patched.filter(r => r.id !== id && r.parentId !== id);
       return cascadeAndCP(filtered);
     });
     setLastUpdated(new Date());
   }, []);
 
   // ── Q1 FIX: Add row — wire depId so new row and its successor form a proper chain ──
+  const handleAddSubTask = useCallback((parentId) => {
+    setRows(prev => {
+      const par = prev.find(r=>r.id===parentId); if(!par) return prev;
+      const ns = {
+        id:Date.now(), fn:par.fn, sf:par.sf, sixPs:par.sixPs||"", task:'Sub-task', spoc:par.spoc,
+        start:'', end:'', revEnd:null, totalDays:0, workingDays:0, delayDays:null,
+        status:'Not Started', remarks:'', isSubTask:true, parentId,
+        isCritical:false, isNearCritical:false, floatDays:null, topoOrder:0,
+        dep:null, depId:null, dep2Id:null, depElseId:null, depEnd:null,
+      };
+      const pi=prev.indexOf(par);
+      const li=prev.reduce((m,r,i)=>r.isSubTask&&r.parentId===parentId?i:m,pi);
+      const nx=[...prev]; nx.splice(li+1,0,ns); return nx;
+    }); setLastUpdated(new Date());
+  }, []);
+
+  const handleDeleteSubTask = useCallback((subId) => {
+    setRows(prev => cascadeAndCP(prev.filter(r=>r.id!==subId)));
+    setLastUpdated(new Date());
+  }, []);
+
   const handleAddRow = useCallback(({fn, sf, task, spoc, td, afterId}) => {
     setRows(prev => {
       // Find insertion position
@@ -1817,7 +2536,7 @@ export default function App() {
                     {rows.filter(r=>r.isCritical).length+" CP tasks ⚡  |  WD = NETWORKDAYS (auto)  |  Add/delete rows auto-cascades network"}
                   </span>
                 </div>
-                <NetworkTable rows={rows} onUpdate={handleUpdate} onDelete={handleDelete} onAddRow={handleAddRow} projectName={projectName} goLiveDate={goLiveDate}/>
+                <NetworkTable rows={rows} onUpdate={handleUpdate} onDelete={handleDelete} onAddRow={handleAddRow} onAddSubTask={handleAddSubTask} onDeleteSubTask={handleDeleteSubTask} projectName={projectName} goLiveDate={goLiveDate}/>
               </div>
             </div>
           )}
