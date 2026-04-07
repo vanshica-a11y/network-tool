@@ -1,10 +1,5 @@
 {
-  "version": 2,
-  "builds": [
-    { "src": "index.html", "use": "@vercel/static" }
-  ],
-  "routes": [
-    { "src": "/NetworkDashboard_v17.jsx", "dest": "/NetworkDashboard_v17.jsx" },
-    { "src": "/(.*)", "dest": "/index.html" }
+  "rewrites": [
+    { "source": "/project/:path*", "destination": "/index.html" }
   ]
 }
