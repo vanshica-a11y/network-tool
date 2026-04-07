@@ -1,4 +1,9 @@
-import React, { useState, useEffect, useCallback, useMemo, useRef } from "react";
+const SUPABASE_URL = "https://rikfjvgihfppwmhbcswp.supabase.co";
+const SUPABASE_KEY = "sb_publishable_WRTgTf2bqtIHmzTX3kNKUg_z2PVadsx";
+const { useState, useEffect, useCallback, useMemo, useRef } = window.React;
+const supabaseClient = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+const React    = window.React;   // needed for React.Fragment and React.createElement
+const ReactDOM = window.ReactDOM;
 
 // ─── HOLIDAYS ─────────────────────────────────────────────────────────────────
 const HOLIDAYS = new Set([
@@ -88,13 +93,24 @@ function getEffectiveEnd(row) {
 // nearCriticalIds = float > 0 and <= 14 days.
 // topoOrder stored on return so flowchart can use it for correct sequencing.
 function computeCriticalPath(rows) {
-  rows = rows.filter(r => !r.isSubTask); // sub-tasks excluded from CP
-  if (!rows.length) return { cpIds: new Set(), nearCriticalIds: new Set(), floatById: {}, topoIds: [] };
+  rows = rows.filter(r => !r.isSubTask);
+  if (!rows.length) return {
+    cpIds: new Set(),
+    nearCriticalIds: new Set(),
+    floatById: {},
+    topoIds: []
+  };
 
-  const idToRow = {}, successors = {}, inDegree = {};
-  rows.forEach(r => { idToRow[r.id] = r; successors[r.id] = []; inDegree[r.id] = 0; });
+  const idToRow = {};
+  const successors = {};
+  const inDegree = {};
   rows.forEach(r => {
-    [r.depId, r.dep2Id].forEach(pid => {
+    idToRow[r.id] = r;
+    successors[r.id] = [];
+    inDegree[r.id] = 0;
+  });
+  rows.forEach(r => {
+    [r.depId, r.dep2Id, r.depElseId].forEach(pid => {
       if (pid != null && idToRow[pid]) {
         successors[pid].push(r.id);
         inDegree[r.id]++;
@@ -102,75 +118,132 @@ function computeCriticalPath(rows) {
     });
   });
 
-  // Topological sort (Kahn's algorithm)
-  const queue = rows.filter(r => inDegree[r.id] === 0).map(r => r.id);
+  // Topological sort
+  const queue = rows
+    .filter(r => inDegree[r.id] === 0)
+    .map(r => r.id);
   const topoIds = [];
   const deg = {...inDegree};
   while (queue.length) {
-    const cur = queue.shift(); topoIds.push(cur);
-    (successors[cur]||[]).forEach(sid => { deg[sid]--; if (deg[sid]===0) queue.push(sid); });
+    const cur = queue.shift();
+    topoIds.push(cur);
+    (successors[cur]||[]).forEach(sid => {
+      deg[sid]--;
+      if (deg[sid] === 0) queue.push(sid);
+    });
   }
 
-  // Forward pass: Earliest Finish (EF) for each node
-  const ef = {};
-  rows.forEach(r => { ef[r.id] = r.start || todayStr(); });
+  // Longest path in days (forward pass)
+  const longest = {};
+  rows.forEach(r => { longest[r.id] = 0; });
   topoIds.forEach(id => {
-    const row = idToRow[id]; if (!row) return;
-    let bestStart = row.start || todayStr();
-    [row.depId, row.dep2Id].forEach(pid => {
-      if (pid == null || !idToRow[pid]) return;
-      const predEnd = ef[pid] || idToRow[pid].end || idToRow[pid].start || todayStr();
-      if (predEnd > bestStart) bestStart = predEnd;
-    });
+    const row = idToRow[id];
+    if (!row) return;
     const td = row.totalDays || 0;
-    ef[id] = td > 0 ? addCalendarDays(bestStart, td) : bestStart;
-  });
-
-  // Project end = latest EF across all nodes
-  let latestFinish = '';
-  rows.forEach(r => { const f = ef[r.id]||''; if (f > latestFinish) latestFinish = f; });
-
-  // Backward pass: Latest Start (LS) for each node
-  const ls = {};
-  rows.forEach(r => { ls[r.id] = latestFinish; });
-  [...topoIds].reverse().forEach(id => {
-    const row = idToRow[id]; if (!row) return;
-    const succs = successors[id]||[];
-    if (!succs.length) { ls[id] = latestFinish; return; }
-    let minLS = latestFinish;
-    succs.forEach(sid => {
-      const succRow = idToRow[sid]; if (!succRow) return;
-      const sls = subtractCalendarDays(ls[sid], succRow.totalDays || 0);
-      if (sls < minLS) minLS = sls;
+    (successors[id]||[]).forEach(sid => {
+      const candidate = longest[id] + td;
+      if (candidate > longest[sid]) {
+        longest[sid] = candidate;
+      }
     });
-    ls[id] = minLS;
   });
 
-  // Float = LS - EF (calendar days). Float == 0 means critical.
-  const floatById = {}, cpIds = new Set(), nearCriticalIds = new Set();
+  // Total project length
+  const maxLen = Math.max(...Object.values(longest));
+
+  // Backward pass — slack for each node
+  const slack = {};
+  rows.forEach(r => { slack[r.id] = 0; });
+  [...topoIds].reverse().forEach(id => {
+    const row = idToRow[id];
+    if (!row) return;
+    const td = row.totalDays || 0;
+    const succs = successors[id]||[];
+    if (!succs.length) {
+      slack[id] = maxLen - (longest[id] + td);
+    } else {
+      slack[id] = Math.min(
+        ...succs.map(sid => slack[sid] +
+          (longest[sid] - longest[id] - td))
+      );
+    }
+  });
+
+  // Critical = slack 0, Near-critical = slack <= 14
+  const cpIds = new Set();
+  const nearCriticalIds = new Set();
+  const floatById = {};
   const NEAR_THRESH = 14;
   rows.forEach(r => {
-    const efD = ef[r.id] || r.end || todayStr();
-    const lsD = ls[r.id] || latestFinish;
-    const fl = Math.max(0, Math.round((new Date(lsD) - new Date(efD)) / 86400000));
-    floatById[r.id] = fl;
-    if (fl === 0) {
+    const s = Math.max(0, Math.round(slack[r.id]));
+    floatById[r.id] = s;
+    if (s === 0) {
       cpIds.add(r.id);
-    } else if (fl <= NEAR_THRESH && r.depId != null) {
+    } else if (s <= NEAR_THRESH) {
       nearCriticalIds.add(r.id);
     }
   });
 
-  // Safety: if nothing got float=0 (disconnected graph), fall back to terminal nodes
+  // Safety fallback
   if (cpIds.size === 0) {
-    rows.filter(r => !(successors[r.id]||[]).length).forEach(r => cpIds.add(r.id));
+    rows
+      .filter(r => !(successors[r.id]||[]).length)
+      .forEach(r => cpIds.add(r.id));
   }
 
   return { cpIds, nearCriticalIds, floatById, topoIds };
 }
 
 
-// ─── CASCADE + CRITICAL PATH ─────────────────────────────────────────────────
+// ─── REHYDRATE FROM SUPABASE ──────────────────────────────────────────────────
+// Loads rows from Supabase JSON and recomputes CP fields from scratch.
+// Rules:
+//  - Trust stored id, depId, dep2Id, depElseId values completely — do NOT
+//    recompute or repair them. They are correct as saved.
+//  - Do NOT call addLabSubTasks() — sub-tasks are already in the saved JSON.
+//  - Only run: type-coerce → cascadeAndCP → second computeCriticalPath pass.
+function rehydrateRows(rawRows) {
+  if (!rawRows || !rawRows.length) return [];
+
+  // LOG 1 is added at the call sites (before rehydrateRows is invoked).
+
+  // Coerce every numeric ID/dep field to a JavaScript number so that
+  // object-key lookups in cascadeAndCP and computeCriticalPath always match.
+  // Do NOT modify depId/dep2Id/depElseId — they are correct as stored.
+  const coercedRows = rawRows.map(r => ({
+    ...r,
+    // Strip stale computed fields so CP is always recomputed from the graph.
+    isCritical:     false,
+    isNearCritical: false,
+    floatDays:      null,
+    topoOrder:      0,
+    // Coerce all numeric ID fields to Number.
+    id:             r.id        != null ? Number(r.id)        : r.id,
+    depId:          r.depId     != null ? Number(r.depId)     : null,
+    dep2Id:         r.dep2Id    != null ? Number(r.dep2Id)    : null,
+    depElseId:      r.depElseId != null ? Number(r.depElseId) : null,
+    depEnd:         r.depEnd    != null ? Number(r.depEnd)    : null,
+    parentId:       r.parentId  != null ? Number(r.parentId)  : null,
+    dep:            r.dep       != null ? Number(r.dep)       : null,
+    dep2:           r.dep2      != null ? Number(r.dep2)      : null,
+    depElse:        r.depElse   != null ? Number(r.depElse)   : null,
+  }));
+
+  // Run cascadeAndCP to recompute dates/workingDays/delayDays.
+  // cascadeAndCP already calls computeCriticalPath internally at the end,
+  // but we run it a second explicit time on the settled result so that
+  // isCritical/floatDays/topoOrder reflect the final post-cascade dates.
+  const afterCascade = cascadeAndCP(coercedRows);
+  const { cpIds, nearCriticalIds, floatById, topoIds } = computeCriticalPath(afterCascade);
+  return afterCascade.map(r => ({
+    ...r,
+    isCritical:     cpIds.has(r.id),
+    isNearCritical: nearCriticalIds.has(r.id),
+    floatDays:      floatById[r.id] != null ? floatById[r.id] : null,
+    topoOrder:      topoIds.indexOf(r.id),
+  }));
+}
+
 // Helper: find all ancestor IDs of a given row (rows that lead to it upstream)
 function getAncestors(targetId, rows) {
   const idToRow = {};
@@ -304,25 +377,6 @@ function cascadeAndCP(rows) {
         ...glRow,
         start: latestAncestorEnd,
         end: latestAncestorEnd, // td:0 so start=end
-        workingDays: 0,
-      };
-    }
-  }
-
-  // ── Connect FG → GoLive +1 day rule ──────────────────────────────────────
-  // If Connect FG to forward warehouses ends later than the current GoLive start,
-  // push GoLive to ConnectFG.end + 1 calendar day (keeps td:0 intact).
-  // If other upstream tasks already push GoLive later, the existing gate above
-  // already handled that — this rule only activates when ConnectFG is the bottleneck.
-  const _cfg = arr.find(r => r.task === "Connect FG to forward warehouses");
-  const _glIdx2 = arr.findIndex(r => r.task === "Going Live on D2C");
-  if (_cfg && _cfg.end && _glIdx2 >= 0) {
-    const _cfgPlusOne = addCalendarDays(_cfg.end, 1);
-    if (_cfgPlusOne > (arr[_glIdx2].start || "")) {
-      arr[_glIdx2] = {
-        ...arr[_glIdx2],
-        start: _cfgPlusOne,
-        end:   _cfgPlusOne,   // td remains 0
         workingDays: 0,
       };
     }
@@ -579,8 +633,9 @@ function addLabSubTasks(rows) {
   const LAB_TASK = 'Lab tests (BOP + Label Mandate Sheet Finalize + Shelf Life test)';
   const parent = rows.find(r => r.task === LAB_TASK && !r.isSubTask);
   if (!parent) return rows;
-  // Duplicate guard — if any sub-task already has this parentId, skip
-  if (rows.some(r => r.isSubTask && r.parentId === parent.id)) return rows;
+  // Duplicate guard — if any sub-task already has this parentId, skip.
+  // Use == (not ===) to survive any number/string coercion from JSON round-trip.
+  if (rows.some(r => r.isSubTask && r.parentId == parent.id)) return rows;
   const SUB_DEFS = [
     { id: 900001, task: 'Lab Tests complete > BOP Final',  spoc: 'Priyanka'         },
     { id: 900002, task: 'LM Sheet Finalization',            spoc: 'Samiksha/Ranjitha' },
@@ -1140,7 +1195,7 @@ function DateRangeFilter({value, onChange}) {
   );
 }
 
-function NetworkTable({rows, onUpdate, onDelete, onAddRow, onAddSubTask, onDeleteSubTask, projectName, goLiveDate}) {
+function NetworkTable({rows, onUpdate, onDelete, onAddRow, onAddSubTask, onDeleteSubTask, projectName, goLiveDate, viewOnly}) {
   const [showAddModal, setShowAddModal] = useState(false);
   const [expandedRows, setExpandedRows] = useState(new Set());
 
@@ -1156,8 +1211,12 @@ function NetworkTable({rows, onUpdate, onDelete, onAddRow, onAddSubTask, onDelet
     Object.values(dateRange).some(v=>v&&(v.from||v.to))
   );
   const isSorted = !!sortCol;
-  const locked   = isFiltered||isSorted;
-  const viewMode = locked ? 'flat' : 'grouped';
+  // viewOnly forces the same read-only rendering as filter/sort lock,
+  // but without showing the "editing disabled" banner.
+  const locked   = isFiltered||isSorted||!!viewOnly;
+  // viewOnly must NOT force flat mode — grouped layout with fn/sf rowSpan
+  // must be preserved in view-only so the table looks identical to edit mode.
+  const viewMode = (isFiltered||isSorted) ? 'flat' : 'grouped';
 
   const filterVals = useMemo(()=>{
     const m=rows.filter(r=>!r.isSubTask);
@@ -1481,7 +1540,7 @@ function NetworkTable({rows, onUpdate, onDelete, onAddRow, onAddSubTask, onDelet
             <span style={{color:'#0369A1'}}>WD</span>=NETWORKDAYS &nbsp;|&nbsp;
             [+/-]=sub-tasks &nbsp;|&nbsp; [=]/[F]=filter
           </span>
-          {locked&&(
+          {locked&&!viewOnly&&(
             <span style={{fontSize:10,background:'#FEF3C7',color:'#92400E',
               padding:'2px 10px',borderRadius:10,fontWeight:600}}>
               {displayRows.length} of {totalMain} tasks shown &mdash;{' '}
@@ -1489,15 +1548,23 @@ function NetworkTable({rows, onUpdate, onDelete, onAddRow, onAddSubTask, onDelet
                 onClick={clearAll}>clear all</span>
             </span>
           )}
-          {locked&&(
+          {locked&&!viewOnly&&(
             <span style={{fontSize:9,color:'#DC2626',background:'#FFF5F5',
               padding:'2px 8px',borderRadius:10,border:'1px solid #FCA5A5'}}>
               Editing disabled while filtered / sorted
             </span>
           )}
+          {locked&&isFiltered&&viewOnly&&(
+            <span style={{fontSize:10,background:'#FEF3C7',color:'#92400E',
+              padding:'2px 10px',borderRadius:10,fontWeight:600}}>
+              {displayRows.length} of {totalMain} tasks shown &mdash;{' '}
+              <span style={{textDecoration:'underline',cursor:'pointer'}}
+                onClick={clearAll}>clear all</span>
+            </span>
+          )}
         </div>
         <div style={{display:'flex',gap:7}}>
-          {!locked&&(
+          {!locked&&!viewOnly&&(
             <button onClick={()=>setShowAddModal(true)}
               style={{display:'flex',alignItems:'center',gap:5,padding:'6px 12px',
                 background:'#EEF2FF',border:'1px dashed #6366F1',borderRadius:6,
@@ -2258,7 +2325,7 @@ function parseExcelRows(data) {
       dep:null, depId:null, dep2Id:null, depElseId:null, depEnd:null});
   }
   // Compute CP on uploaded data
-  const cpIds = computeCriticalPath(rows);
+  const { cpIds } = computeCriticalPath(rows);
   return rows.map(r=>({...r,isCritical:cpIds.has(r.id)}));
 }
 
@@ -2271,18 +2338,508 @@ function deriveGoLive(rows) {
   return ends[ends.length-1]||"";
 }
 
+// ─── SHARE MODAL ─────────────────────────────────────────────────────────────
+// Shows shareable URL + access level selector. Saves access to Supabase.
+const ACCESS_LEVELS = [
+  { value: "edit",      label: "Edit",      desc: "Anyone with the link can update the network",   color: "#059669", bg: "#F0FDF4", border: "#BBF7D0" },
+  { value: "view_only", label: "View only", desc: "Anyone can see it but not make changes",         color: "#D97706", bg: "#FFFBEB", border: "#FDE68A" },
+  { value: "no_access", label: "No access", desc: "Link is private — only you can open it",         color: "#6B7280", bg: "#F9FAFB", border: "#E5E7EB" },
+];
+
+function ShareModal({ projectId, onClose }) {
+  const [access,  setAccess]  = useState("edit");
+  const [copied,  setCopied]  = useState(false);
+  const [saving,  setSaving]  = useState(false);
+  const [loadErr, setLoadErr] = useState(null);
+  const url = window.location.origin + "/project/" + projectId;
+
+  // Load current access level from Supabase on open
+  useEffect(() => {
+    if (!projectId) return;
+    (async () => {
+      const { data, error } = await supabaseClient
+        .from("projects")
+        .select("access")
+        .eq("id", projectId)
+        .single();
+      if (!error && data?.access) setAccess(data.access);
+      if (error) setLoadErr(error.message);
+    })();
+  }, [projectId]);
+
+  const handleAccessChange = async (val) => {
+    setAccess(val);
+    if (!projectId) return;
+    setSaving(true);
+    await supabaseClient.from("projects").update({ access: val }).eq("id", projectId);
+    setSaving(false);
+  };
+
+  const copyLink = () => {
+    navigator.clipboard.writeText(url);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  };
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.45)", zIndex: 4000, display: "flex", alignItems: "center", justifyContent: "center" }}>
+      <div style={{ background: "#FFF", borderRadius: 14, padding: 24, width: 480, boxShadow: "0 20px 50px rgba(0,0,0,.25)", fontFamily: "'Segoe UI',system-ui,sans-serif" }}>
+        {/* Title */}
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 18 }}>
+          <h3 style={{ margin: 0, fontSize: 15, fontWeight: 700, color: "#1B2A4A" }}>🔗 Share Network</h3>
+          <button onClick={onClose} style={{ background: "none", border: "none", cursor: "pointer", color: "#9CA3AF", fontSize: 18, lineHeight: 1 }}>✕</button>
+        </div>
+
+        {/* URL row */}
+        <div style={{ marginBottom: 20 }}>
+          <label style={{ fontSize: 10, fontWeight: 600, color: "#6B7280", display: "block", marginBottom: 6 }}>Shareable link</label>
+          <div style={{ display: "flex", gap: 7, alignItems: "center" }}>
+            <div style={{ flex: 1, background: "#F9FAFB", border: "1px solid #E5E7EB", borderRadius: 7, padding: "8px 11px", fontSize: 11, color: "#374151", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+              {url}
+            </div>
+            <button onClick={copyLink}
+              style={{ padding: "8px 14px", background: copied ? "#D1FAE5" : "#1B2A4A", color: copied ? "#059669" : "#FFF", border: "none", borderRadius: 7, cursor: "pointer", fontSize: 11, fontWeight: 600, flexShrink: 0, transition: "background .2s" }}>
+              {copied ? "Copied!" : "Copy link"}
+            </button>
+          </div>
+        </div>
+
+        {/* Access level */}
+        <div style={{ marginBottom: 8 }}>
+          <label style={{ fontSize: 10, fontWeight: 600, color: "#6B7280", display: "block", marginBottom: 8 }}>
+            Access level {saving && <span style={{ color: "#9CA3AF", fontWeight: 400 }}>— saving…</span>}
+          </label>
+          {loadErr && <div style={{ fontSize: 10, color: "#DC2626", marginBottom: 8 }}>Could not load access: {loadErr}</div>}
+          <div style={{ display: "flex", flexDirection: "column", gap: 7 }}>
+            {ACCESS_LEVELS.map(lvl => (
+              <label key={lvl.value}
+                style={{ display: "flex", alignItems: "center", gap: 11, padding: "10px 13px", border: `1.5px solid ${access === lvl.value ? lvl.border : "#E5E7EB"}`, borderRadius: 8, cursor: "pointer", background: access === lvl.value ? lvl.bg : "#FFF", transition: "all .15s" }}>
+                <input type="radio" name="access" value={lvl.value} checked={access === lvl.value} onChange={() => handleAccessChange(lvl.value)} style={{ accentColor: lvl.color, width: 14, height: 14, flexShrink: 0 }} />
+                <div>
+                  <div style={{ fontSize: 12, fontWeight: 700, color: access === lvl.value ? lvl.color : "#374151" }}>{lvl.label}</div>
+                  <div style={{ fontSize: 10, color: "#6B7280", marginTop: 1 }}>{lvl.desc}</div>
+                </div>
+              </label>
+            ))}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
+// Top-level screen: lists all persisted projects fetched from Supabase.
+// Clicking a card loads that project's rows and opens the main App view.
+// "+ New Network" opens the existing NewProjectBuilder modal.
+function ProjectHub({ onOpenProject }) {
+  const [projects, setProjects] = useState([]);
+  const [loading, setLoading]   = useState(true);
+  const [error, setError]       = useState(null);
+  const [showBuilder, setShowBuilder] = useState(false);
+  const [shareProjectId, setShareProjectId] = useState(null);
+
+  // Fetch project list on mount — include rows so we can compute progress on each card.
+  useEffect(() => {
+    (async () => {
+      setLoading(true);
+      supabaseClient.from("projects").select("*", { count: "exact", head: true }); // keepalive: resets Supabase inactivity timer
+      const { data, error } = await supabaseClient
+        .from("projects")
+        .select("id, name, go_live_date, updated_at, rows")
+        .order("updated_at", { ascending: false });
+      if (error) setError(error.message);
+      else setProjects(data || []);
+      setLoading(false);
+    })();
+  }, []);
+
+  // Load a project's full rows from Supabase then hand off to App view.
+  // Reads from projects.rows (the JSONB column written by auto-save) so it
+  // uses the same data source as the deep-link loader in Root.
+  const handleOpenProject = async (proj) => {
+    const { data, error } = await supabaseClient
+      .from("projects")
+      .select("id, name, go_live_date, rows")
+      .eq("id", proj.id)
+      .single();
+    if (error) { alert("Failed to load project: " + error.message); return; }
+    const rows = rehydrateRows(data.rows);
+    onOpenProject({ projectId: data.id, projectName: data.name, initialRows: rows, goLiveDate: data.go_live_date });
+  };
+
+  // NewProjectBuilder calls onGenerate with (rows, name) after generate() completes.
+  // We insert a new row into projects, get the UUID back, then open App at /project/:id.
+  const handleGenerate = async (generatedRows, name) => {
+    setShowBuilder(false);
+    const gl = deriveGoLive(generatedRows);
+    const { data, error } = await supabaseClient
+      .from("projects")
+      .insert({
+        name:         name,
+        rows:         generatedRows,
+        go_live_date: gl || null,
+        updated_at:   new Date().toISOString(),
+        access:       "edit",
+      })
+      .select("id")
+      .single();
+    if (error) {
+      alert("Could not save new project: " + error.message);
+      // Fall back to in-memory (no URL) so the user doesn't lose their work
+      onOpenProject({ projectId: null, projectName: name, initialRows: generatedRows, goLiveDate: gl });
+      return;
+    }
+    // Pass the real UUID — Root.handleOpenProject will call navigate(/project/:id)
+    onOpenProject({ projectId: data.id, projectName: name, initialRows: generatedRows, goLiveDate: gl });
+  };
+
+  // ── Card helpers ──────────────────────────────────────────────────────────
+  const getProgress = (rows) => {
+    if (!rows || !rows.length) return { pct: 0, done: 0, total: 0 };
+    const mainRows = rows.filter(r => !r.isSubTask);
+    const total = mainRows.length;
+    const done  = mainRows.filter(r => r.status === "Done").length;
+    const pct   = total ? Math.round((done / total) * 100) : 0;
+    return { pct, done, total };
+  };
+
+  const getStatus = (pct, goLiveDate) => {
+    const past = goLiveDate && new Date(goLiveDate) < new Date(todayStr());
+    if (pct === 100 || past) return { label: "Launched", color: "#059669", bg: "#D1FAE5" };
+    if (pct === 0)           return { label: "Planning", color: "#7C3AED", bg: "#EDE9FE" };
+    return                          { label: "In progress", color: "#2563EB", bg: "#DBEAFE" };
+  };
+
+  return (
+    <div style={{ minHeight: "100vh", background: "#F0F4F8", fontFamily: "'Segoe UI',system-ui,sans-serif" }}>
+      {/* Header */}
+      <div style={{ background: "#1B2A4A", padding: "0 32px", display: "flex", alignItems: "center", justifyContent: "space-between", height: 56, boxShadow: "0 2px 8px rgba(0,0,0,.15)" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <div style={{ width: 28, height: 28, background: "#00C896", borderRadius: 7, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 14, fontWeight: 900, color: "#1B2A4A" }}>N</div>
+          <span style={{ fontSize: 15, fontWeight: 800, color: "#FFF" }}>NetManager</span>
+          <span style={{ fontSize: 10, color: "#64748B", marginLeft: 4 }}>All Networks</span>
+        </div>
+        <button
+          onClick={() => setShowBuilder(true)}
+          style={{ display: "flex", alignItems: "center", gap: 6, padding: "7px 16px", background: "#00C896", border: "none", borderRadius: 7, cursor: "pointer", fontSize: 12, fontWeight: 700, color: "#1B2A4A" }}>
+          <I.New /> + New Network
+        </button>
+      </div>
+
+      {/* Body */}
+      <div style={{ maxWidth: 1100, margin: "0 auto", padding: "32px 24px" }}>
+        <h2 style={{ margin: "0 0 6px", fontSize: 18, fontWeight: 800, color: "#1B2A4A" }}>Your Launch Networks</h2>
+        <p style={{ margin: "0 0 24px", fontSize: 11, color: "#9CA3AF" }}>Click a project to open it, or create a new network from scratch.</p>
+
+        {loading && (
+          <div style={{ display: "flex", alignItems: "center", gap: 9, color: "#6B7280", fontSize: 13 }}>
+            <div style={{ width: 16, height: 16, border: "3px solid #E5E7EB", borderTopColor: "#6366F1", borderRadius: "50%", animation: "spin .8s linear infinite" }} />
+            Loading projects…
+          </div>
+        )}
+
+        {error && (
+          <div style={{ background: "#FFF5F5", border: "1px solid #FCA5A5", borderRadius: 8, padding: "12px 16px", color: "#DC2626", fontSize: 12 }}>
+            Could not load projects: {error}
+          </div>
+        )}
+
+        {!loading && !error && projects.length === 0 && (
+          <div style={{ textAlign: "center", padding: "60px 0", color: "#9CA3AF" }}>
+            <div style={{ fontSize: 32, marginBottom: 12 }}>📋</div>
+            <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 6 }}>No networks yet</div>
+            <div style={{ fontSize: 11 }}>Click "+ New Network" to build your first launch plan.</div>
+          </div>
+        )}
+
+        {!loading && !error && projects.length > 0 && (
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill,minmax(300px,1fr))", gap: 16 }}>
+            {projects.map(proj => {
+              const { pct, done, total } = getProgress(proj.rows);
+              const daysToGL = proj.go_live_date
+                ? Math.ceil((new Date(proj.go_live_date) - new Date(todayStr())) / 86400000)
+                : null;
+              const status = getStatus(pct, proj.go_live_date);
+              const launched = daysToGL != null && daysToGL <= 0;
+
+              return (
+                <div key={proj.id}
+                  style={{ background: "#FFF", border: "1px solid #E5E7EB", borderRadius: 12, padding: "18px 20px", cursor: "pointer", transition: "box-shadow .15s", boxShadow: "0 1px 3px rgba(0,0,0,.06)", display: "flex", flexDirection: "column", gap: 10 }}
+                  onMouseEnter={e => e.currentTarget.style.boxShadow = "0 4px 16px rgba(0,0,0,.12)"}
+                  onMouseLeave={e => e.currentTarget.style.boxShadow = "0 1px 3px rgba(0,0,0,.06)"}
+                  onClick={() => handleOpenProject(proj)}>
+
+                  {/* Row 1: name + status badge */}
+                  <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 8 }}>
+                    <div style={{ fontSize: 13, fontWeight: 700, color: "#1B2A4A", flex: 1, lineHeight: 1.3 }}>{proj.name}</div>
+                    <span style={{ fontSize: 10, fontWeight: 700, color: status.color, background: status.bg, borderRadius: 20, padding: "2px 9px", flexShrink: 0, whiteSpace: "nowrap" }}>
+                      {status.label}
+                    </span>
+                  </div>
+
+                  {/* Row 2: go-live + T-minus */}
+                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                    <span style={{ width: 7, height: 7, borderRadius: "50%", background: "#059669", display: "inline-block", flexShrink: 0 }} />
+                    <span style={{ fontSize: 11, fontWeight: 700, color: "#059669" }}>
+                      Go-Live: {proj.go_live_date ? fmtDisplay(proj.go_live_date) : "—"}
+                    </span>
+                    {daysToGL != null && (
+                      launched
+                        ? <span style={{ fontSize: 10, fontWeight: 700, color: "#059669", background: "#D1FAE5", borderRadius: 20, padding: "2px 8px" }}>Launched</span>
+                        : <span style={{ fontSize: 10, fontWeight: 700, color: "#6B7280", background: "#F3F4F6", borderRadius: 20, padding: "2px 8px" }}>T-{daysToGL}d</span>
+                    )}
+                  </div>
+
+                  {/* Row 3: last updated */}
+                  <div style={{ fontSize: 9, color: "#9CA3AF" }}>
+                    Updated {proj.updated_at ? new Date(proj.updated_at).toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit" }) : "—"}
+                  </div>
+
+                  {/* Row 4: progress bar */}
+                  <div>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 5 }}>
+                      <span style={{ fontSize: 9, fontWeight: 600, color: "#6B7280" }}>Progress</span>
+                      <span style={{ fontSize: 9, fontWeight: 700, color: "#374151" }}>{pct}% · {done}/{total} tasks</span>
+                    </div>
+                    <div style={{ height: 5, background: "#F3F4F6", borderRadius: 4, overflow: "hidden" }}>
+                      <div style={{ height: "100%", width: `${pct}%`, background: pct === 100 ? "#059669" : "#3B82F6", borderRadius: 4, transition: "width .4s" }} />
+                    </div>
+                  </div>
+
+                  {/* Row 5: Share button */}
+                  <div style={{ display: "flex", justifyContent: "flex-end" }}>
+                    <button
+                      onClick={e => { e.stopPropagation(); setShareProjectId(proj.id); }}
+                      style={{ display: "flex", alignItems: "center", gap: 5, padding: "5px 11px", background: "#EFF6FF", border: "1px solid #BFDBFE", borderRadius: 6, cursor: "pointer", fontSize: 10, fontWeight: 600, color: "#1D4ED8" }}>
+                      🔗 Share
+                    </button>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+
+      {/* New Network Builder modal — reuses the existing component exactly */}
+      {showBuilder && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.45)", zIndex: 3000, display: "flex", alignItems: "flex-start", justifyContent: "center", overflowY: "auto", padding: "40px 20px" }}>
+          <div style={{ width: "100%", maxWidth: 820 }}>
+            <NewProjectBuilder onGenerate={handleGenerate} onCancel={() => setShowBuilder(false)} />
+          </div>
+        </div>
+      )}
+
+      {/* Share modal — opened from card Share button */}
+      {shareProjectId && (
+        <ShareModal projectId={shareProjectId} onClose={() => setShareProjectId(null)} />
+      )}
+
+      <style>{`@keyframes spin{to{transform:rotate(360deg);}}`}</style>
+    </div>
+  );
+}
+
+
+// ─── ROUTING (native history API — no external library) ──────────────────────
+// Parses the current pathname into a route descriptor.
+function parsePath(pathname) {
+  const m = pathname.match(/^\/project\/([^/]+)/);
+  if (m) return { view: "project", id: m[1] };
+  return { view: "hub" };
+}
+
+// Hook: tracks window.location.pathname and exposes a navigate() function.
+// Listens to the browser's popstate event so back/forward buttons work.
+function useRoute() {
+  const [route, setRoute] = useState(() => parsePath(window.location.pathname));
+
+  useEffect(() => {
+    const onPop = () => setRoute(parsePath(window.location.pathname));
+    window.addEventListener("popstate", onPop);
+    return () => window.removeEventListener("popstate", onPop);
+  }, []);
+
+  const navigate = (pathname) => {
+    window.history.pushState(null, "", pathname);
+    setRoute(parsePath(pathname));
+  };
+
+  return { route, navigate };
+}
+
+// ─── ROOT ────────────────────────────────────────────────────────────────────
+// Owns routing. Renders ProjectHub or App based on the current URL.
+// Handles deep-linked /project/:id by fetching from Supabase on mount.
+function Root() {
+  const { route, navigate } = useRoute();
+
+  const [activeProject, setActiveProject]   = useState(null);
+  const [deepLoading,   setDeepLoading]     = useState(false);
+  const [deepError,     setDeepError]       = useState(null);
+  // Ref tracks the last project ID we successfully fetched, so the useEffect
+  // guard is never stale (refs don't go through the closure capture problem).
+  const loadedIdRef = useRef(null);
+
+  // ── Deep-link: load project data when URL is /project/:id on first render ──
+  // Also re-runs whenever the route changes to a project view (e.g. browser forward).
+  useEffect(() => {
+    if (route.view !== "project") {
+      // Navigated back to hub — clear active project so ProjectHub renders fresh.
+      setActiveProject(null);
+      loadedIdRef.current = null;
+      return;
+    }
+    // If we already have the right project loaded, don't re-fetch.
+    if (loadedIdRef.current === String(route.id)) return;
+
+    // Fetch the project row + its network rows from Supabase.
+    (async () => {
+      setDeepLoading(true);
+      setDeepError(null);
+      try {
+        // 1. Fetch project metadata + stored rows
+        const { data: projData, error: projErr } = await supabaseClient
+          .from("projects")
+          .select("id, name, go_live_date, rows, access")
+          .eq("id", route.id)
+          .single();
+        if (projErr) throw new Error(projErr.message);
+
+        // 2. Rehydrate rows — strip stale computed fields and rerun cascadeAndCP
+        //    so isCritical, floatDays, topoOrder are always freshly computed
+        //    from the live dependency graph, not from stale stored values.
+        const loadedRows = rehydrateRows(projData.rows);
+
+        // 3. Determine view-only mode: only enforced for direct URL opens.
+        const isViewOnly = projData.access === "view_only";
+
+        loadedIdRef.current = String(projData.id);
+        setActiveProject({
+          projectId:   projData.id,
+          projectName: projData.name,
+          initialRows: loadedRows,
+          goLiveDate:  projData.go_live_date,
+          viewOnly:    isViewOnly,
+        });
+      } catch (e) {
+        setDeepError(e.message);
+      } finally {
+        setDeepLoading(false);
+      }
+    })();
+  }, [route]);
+
+  // ── Handlers passed down to children ────────────────────────────────────────
+  const handleOpenProject = (proj) => {
+    if (proj.projectId) {
+      loadedIdRef.current = String(proj.projectId);
+      navigate(`/project/${proj.projectId}`);
+    }
+    setActiveProject(proj);
+    // null projectId = unsaved in-memory network; stay at current URL
+  };
+
+  const handleBack = () => {
+    loadedIdRef.current = null;
+    setActiveProject(null);
+    navigate("/");
+  };
+
+  // ── Render ───────────────────────────────────────────────────────────────────
+  // Show hub when route is "/" regardless of activeProject state.
+  if (route.view === "hub") {
+    return <ProjectHub onOpenProject={handleOpenProject} />;
+  }
+
+  // /project/:id — waiting for deep-link fetch
+  if (deepLoading) {
+    return (
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100vh", fontFamily: "'Segoe UI',system-ui,sans-serif", background: "#F0F4F8", flexDirection: "column", gap: 12 }}>
+        <div style={{ width: 24, height: 24, border: "3px solid #E5E7EB", borderTopColor: "#6366F1", borderRadius: "50%", animation: "spin .8s linear infinite" }} />
+        <span style={{ fontSize: 13, color: "#6B7280" }}>Loading project…</span>
+        <style>{`@keyframes spin{to{transform:rotate(360deg);}}`}</style>
+      </div>
+    );
+  }
+
+  if (deepError) {
+    return (
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100vh", fontFamily: "'Segoe UI',system-ui,sans-serif", background: "#F0F4F8", flexDirection: "column", gap: 12 }}>
+        <div style={{ background: "#FFF5F5", border: "1px solid #FCA5A5", borderRadius: 10, padding: "20px 28px", maxWidth: 420, textAlign: "center" }}>
+          <div style={{ fontSize: 13, fontWeight: 700, color: "#DC2626", marginBottom: 8 }}>Could not load project</div>
+          <div style={{ fontSize: 11, color: "#6B7280", marginBottom: 16 }}>{deepError}</div>
+          <button onClick={handleBack} style={{ padding: "7px 18px", background: "#1B2A4A", color: "#FFF", border: "none", borderRadius: 7, cursor: "pointer", fontSize: 12, fontWeight: 600 }}>← All Networks</button>
+        </div>
+      </div>
+    );
+  }
+
+  if (activeProject) {
+    return (
+      <App
+        projectId={activeProject.projectId}
+        projectName={activeProject.projectName}
+        initialRows={activeProject.initialRows}
+        goLiveDate={activeProject.goLiveDate}
+        viewOnly={!!activeProject.viewOnly}
+        onBack={handleBack}
+      />
+    );
+  }
+
+  // URL is /project/:id but fetch hasn't started yet (brief flash) — show nothing.
+  return null;
+}
+
 // ─── MAIN APP ─────────────────────────────────────────────────────────────────
-export default function App() {
-  const [rows, setRows] = useState(DEMO_ROWS);
-  const [projectName, setProjectName] = useState("Isolate Protein Powder");
+// Now accepts props instead of reading DEMO_ROWS directly.
+// All internal logic — cascades, CP, filters, sub-tasks, 4 tabs — is unchanged.
+function App({ projectId, projectName: initialProjectName, initialRows, onBack, viewOnly, goLiveDate: goLiveDateProp }) {
+  const [rows, setRows] = useState(initialRows);
+  const [projectName, setProjectName] = useState(initialProjectName);
   const [activeModule, setActiveModule] = useState("network");
   const [cpView, setCpView] = useState("gantt");
   const [editingProject, setEditingProject] = useState(false);
   const [showNewProject, setShowNewProject] = useState(false);
   const [lastUpdated, setLastUpdated] = useState(new Date());
+  // "idle" | "pending" | "saved" | "error"
+  const [saveStatus, setSaveStatus] = useState("idle");
+  const saveTimerRef = useRef(null);
+  const [showShare, setShowShare] = useState(false);
+  // goLiveDate is always derived live from rows so it stays in sync with the
+  // "Going Live on D2C" row in the network table whenever the network changes.
+  const goLiveDate = useMemo(() => {
+    const glRow = rows.find(r => r.task === "Going Live on D2C");
+    return glRow ? (glRow.end || glRow.start || "") : "";
+  }, [rows]);
 
-  // Go-live always derived from live network
-  const goLiveDate = useMemo(() => deriveGoLive(rows), [rows]);
+  // ── Debounced auto-save to Supabase ─────────────────────────────────────────
+  // Fires 1 second after rows (or projectName / goLiveDate) last changed.
+  // Skipped when projectId is null (unsaved in-memory network from New Project).
+  useEffect(() => {
+    if (!projectId) return;               // no project in DB yet — skip
+    setSaveStatus("pending");             // show "Saving..." immediately
+    clearTimeout(saveTimerRef.current);
+    saveTimerRef.current = setTimeout(async () => {
+      try {
+        const { error } = await supabaseClient
+          .from("projects")
+          .upsert({
+            id:           projectId,
+            name:         projectName,
+            rows:         rows,
+            go_live_date: goLiveDate,
+            updated_at:   new Date().toISOString(),
+          });
+        setSaveStatus(error ? "error" : "saved");
+      } catch {
+        setSaveStatus("error");
+      }
+    }, 1000);
+    return () => clearTimeout(saveTimerRef.current);
+  }, [rows, projectName, goLiveDate, projectId]);
 
   // ── Update a row and cascade ─────────────────────────────────────────────────
   const handleUpdate = useCallback((id, updated, doCascade) => {
@@ -2492,6 +3049,10 @@ export default function App() {
         {/* Header */}
         <div style={{background:"#FFF",borderBottom:"1px solid #E5E7EB",padding:"10px 22px",display:"flex",justifyContent:"space-between",alignItems:"center",boxShadow:"0 1px 3px rgba(0,0,0,.06)"}}>
           <div style={{display:"flex",alignItems:"center",gap:10}}>
+            {/* ← All Networks back button */}
+            <button onClick={onBack} style={{display:"flex",alignItems:"center",gap:5,padding:"5px 10px",background:"#F3F4F6",border:"1px solid #E5E7EB",borderRadius:6,cursor:"pointer",fontSize:11,fontWeight:600,color:"#374151"}}>
+              ← All Networks
+            </button>
             {editingProject?(
               <input autoFocus value={projectName} onChange={e=>setProjectName(e.target.value)}
                 onBlur={()=>setEditingProject(false)} onKeyDown={e=>{if(e.key==="Enter")setEditingProject(false);}}
@@ -2503,6 +3064,31 @@ export default function App() {
             <span style={{fontSize:10,color:"#9CA3AF"}}>
               {"/ "+(showNewProject?"New Project":(nav.find(n=>n.id===activeModule)||{}).label)}
             </span>
+            {/* ── Save indicator ── */}
+            {saveStatus==="pending" && (
+              <span style={{fontSize:10,color:"#9CA3AF",display:"flex",alignItems:"center",gap:4}}>
+                <span style={{width:6,height:6,borderRadius:"50%",background:"#D1D5DB",display:"inline-block"}}/>
+                Saving…
+              </span>
+            )}
+            {saveStatus==="saved" && (
+              <span style={{fontSize:10,color:"#059669",display:"flex",alignItems:"center",gap:4}}>
+                <span style={{width:6,height:6,borderRadius:"50%",background:"#059669",display:"inline-block"}}/>
+                Saved
+              </span>
+            )}
+            {saveStatus==="error" && (
+              <span style={{fontSize:10,color:"#DC2626",display:"flex",alignItems:"center",gap:4}}>
+                <span style={{width:6,height:6,borderRadius:"50%",background:"#DC2626",display:"inline-block"}}/>
+                Save failed
+              </span>
+            )}
+            {/* ── View-only badge ── */}
+            {viewOnly && (
+              <span style={{fontSize:10,fontWeight:700,color:"#92400E",background:"#FEF3C7",border:"1px solid #FDE68A",borderRadius:20,padding:"2px 10px",flexShrink:0}}>
+                View only
+              </span>
+            )}
           </div>
           <div style={{display:"flex",alignItems:"center",gap:9}}>
             <div style={{background:"#F0FDF4",border:"1px solid #BBF7D0",borderRadius:20,padding:"5px 14px",display:"flex",alignItems:"center",gap:6}}>
@@ -2519,6 +3105,10 @@ export default function App() {
               <I.Upload/>&nbsp;Upload Excel
               <input type="file" accept=".xlsx,.xls" onChange={handleUpload} style={{display:"none"}}/>
             </label>
+            <button onClick={()=>setShowShare(true)}
+              style={{display:"flex",alignItems:"center",gap:5,padding:"6px 12px",background:"#EFF6FF",border:"1px solid #BFDBFE",borderRadius:6,cursor:"pointer",fontSize:11,color:"#1D4ED8",fontWeight:600}}>
+              🔗 Share
+            </button>
           </div>
         </div>
 
@@ -2536,7 +3126,7 @@ export default function App() {
                     {rows.filter(r=>r.isCritical).length+" CP tasks ⚡  |  WD = NETWORKDAYS (auto)  |  Add/delete rows auto-cascades network"}
                   </span>
                 </div>
-                <NetworkTable rows={rows} onUpdate={handleUpdate} onDelete={handleDelete} onAddRow={handleAddRow} onAddSubTask={handleAddSubTask} onDeleteSubTask={handleDeleteSubTask} projectName={projectName} goLiveDate={goLiveDate}/>
+                <NetworkTable rows={rows} onUpdate={handleUpdate} onDelete={handleDelete} onAddRow={handleAddRow} onAddSubTask={handleAddSubTask} onDeleteSubTask={handleDeleteSubTask} projectName={projectName} goLiveDate={goLiveDate} viewOnly={viewOnly}/>
               </div>
             </div>
           )}
@@ -2592,6 +3182,12 @@ export default function App() {
           {!showNewProject&&activeModule==="reminders"&&<RemindersModule rows={rows} projectName={projectName} goLiveDate={goLiveDate}/>}
         </div>
       </div>
+      {/* Share modal */}
+      {showShare && <ShareModal projectId={projectId} onClose={()=>setShowShare(false)}/>}
     </div>
   );
 }
+// ─── MOUNT ────────────────────────────────────────────────────────────────────
+ReactDOM.createRoot(document.getElementById("root")).render(
+  React.createElement(Root)
+);
